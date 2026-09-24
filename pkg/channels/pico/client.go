@@ -3,7 +3,9 @@ package pico
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,6 +21,27 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
+// Reconnect tuning. The server may close the socket on purpose at any time
+// (the driftwood relay recycles every connection after a short, jittered
+// lifetime), so a dropped connection is routine, not an error.
+const (
+	// reconnectBaseBackoff is the first wait after a failed dial; it doubles
+	// per consecutive failure up to reconnectMaxBackoff. Each wait is jittered
+	// to [d/2, d] so a fleet of gateways does not redial in lockstep.
+	reconnectBaseBackoff = 500 * time.Millisecond
+	reconnectMaxBackoff  = 15 * time.Second
+	// reconnectPollInterval is a safety net only: a dropped connection wakes
+	// reconnectLoop at once through the redial channel.
+	reconnectPollInterval = 1 * time.Second
+)
+
+// sendReconnectWait is how long Send parks on a dropped connection, waiting
+// for reconnectLoop to install a new one, before it gives up with
+// ErrSendFailed. Without it, a reply produced during the sub-second gap of a
+// routine server-side recycle was dropped for good (the channel manager
+// treats ErrSendFailed as permanent). A var so tests can shorten it.
+var sendReconnectWait = 30 * time.Second
+
 // PicoClientChannel connects to a remote Pico Protocol WebSocket server.
 type PicoClientChannel struct {
 	*channels.BaseChannel
@@ -27,6 +50,11 @@ type PicoClientChannel struct {
 	mu     sync.Mutex
 	ctx    context.Context
 	cancel context.CancelFunc
+	// connReady is closed and replaced (under mu) each time dial installs a
+	// new connection, waking every Send parked in liveConn.
+	connReady chan struct{}
+	// redial wakes reconnectLoop the moment a connection's read loop exits.
+	redial chan struct{}
 }
 
 // NewPicoClientChannel creates a new Pico Protocol client channel.
@@ -44,6 +72,8 @@ func NewPicoClientChannel(
 	return &PicoClientChannel{
 		BaseChannel: base,
 		config:      cfg,
+		connReady:   make(chan struct{}),
+		redial:      make(chan struct{}, 1),
 	}, nil
 }
 
@@ -108,14 +138,62 @@ func (c *PicoClientChannel) dial() error {
 
 	c.mu.Lock()
 	c.conn = pc
+	close(c.connReady)
+	c.connReady = make(chan struct{})
 	c.mu.Unlock()
 
 	go c.readLoop(connCtx, pc)
 	return nil
 }
 
-// reconnectLoop re-dials when the connection drops.
+// signalRedial wakes reconnectLoop without blocking (one pending wake is
+// enough; the loop re-reads the connection state itself).
+func (c *PicoClientChannel) signalRedial() {
+	select {
+	case c.redial <- struct{}{}:
+	default:
+	}
+}
+
+// reconnectBackoff returns the jittered wait after the n-th consecutive
+// failed dial (n >= 1): uniform in [d/2, d] with d = base * 2^(n-1), capped.
+func reconnectBackoff(n int) time.Duration {
+	d := reconnectMaxBackoff
+	if n < 16 {
+		d = min(reconnectBaseBackoff<<(n-1), reconnectMaxBackoff)
+	}
+	half := d / 2
+	return half + rand.N(half+1)
+}
+
+// liveConn returns the current open connection, parking up to
+// sendReconnectWait for reconnectLoop to install one if it is down.
+func (c *PicoClientChannel) liveConn(ctx context.Context) (*picoConn, error) {
+	deadline := time.NewTimer(sendReconnectWait)
+	defer deadline.Stop()
+	for {
+		c.mu.Lock()
+		pc, ready := c.conn, c.connReady
+		c.mu.Unlock()
+		if pc != nil && !pc.closed.Load() {
+			return pc, nil
+		}
+		select {
+		case <-ready:
+		case <-deadline.C:
+			return nil, channels.ErrSendFailed
+		case <-ctx.Done():
+			return nil, channels.ErrSendFailed
+		case <-c.ctx.Done():
+			return nil, channels.ErrNotRunning
+		}
+	}
+}
+
+// reconnectLoop re-dials as soon as the connection drops, with jittered
+// exponential backoff while dials keep failing.
 func (c *PicoClientChannel) reconnectLoop() {
+	failures := 0
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -128,11 +206,14 @@ func (c *PicoClientChannel) reconnectLoop() {
 		c.mu.Unlock()
 
 		if pc == nil || pc.closed.Load() {
-			backoff := 5 * time.Second
 			logger.InfoC("pico_client", "Reconnecting...")
 			if err := c.dial(); err != nil {
+				failures++
+				backoff := reconnectBackoff(failures)
 				logger.WarnCF("pico_client", "Reconnect failed", map[string]any{
-					"error": err.Error(),
+					"error":   err.Error(),
+					"attempt": failures,
+					"backoff": backoff.String(),
 				})
 				select {
 				case <-c.ctx.Done():
@@ -141,19 +222,24 @@ func (c *PicoClientChannel) reconnectLoop() {
 				}
 				continue
 			}
+			failures = 0
 			logger.InfoC("pico_client", "Reconnected")
 		}
 
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-time.After(1 * time.Second):
+		case <-c.redial:
+		case <-time.After(reconnectPollInterval):
 		}
 	}
 }
 
 func (c *PicoClientChannel) readLoop(connCtx context.Context, pc *picoConn) {
-	defer pc.close()
+	defer func() {
+		pc.close()
+		c.signalRedial()
+	}()
 
 	readTimeout := time.Duration(c.config.ReadTimeout) * time.Second
 	if readTimeout <= 0 {
@@ -301,18 +387,32 @@ func (c *PicoClientChannel) Send(ctx context.Context, msg bus.OutboundMessage) (
 	if !c.IsRunning() {
 		return nil, channels.ErrNotRunning
 	}
-	c.mu.Lock()
-	pc := c.conn
-	c.mu.Unlock()
-	if pc == nil || pc.closed.Load() {
-		return nil, channels.ErrSendFailed
-	}
 
 	outMsg := newMessage(TypeMessageSend, map[string]any{
 		PayloadKeyContent: msg.Content,
 	})
 	outMsg.SessionID = strings.TrimPrefix(msg.ChatID, "pico_client:")
-	return nil, pc.writeJSON(outMsg)
+
+	// A write can only be retried when it provably put nothing on the wire:
+	// the connection was already closed locally, or the server's close frame
+	// had arrived (gorilla's ErrCloseSent). Any other error is returned as-is
+	// for the manager's retry policy, which calls Send again.
+	for attempt := 0; ; attempt++ {
+		pc, err := c.liveConn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		err = pc.writeJSON(outMsg)
+		if err == nil || attempt > 0 {
+			return nil, err
+		}
+		if !errors.Is(err, errConnClosed) && !errors.Is(err, websocket.ErrCloseSent) {
+			return nil, err
+		}
+		// The server is recycling this connection; make sure it is torn
+		// down so liveConn waits for its replacement instead of reusing it.
+		pc.close()
+	}
 }
 
 // StartTyping implements channels.TypingCapable.

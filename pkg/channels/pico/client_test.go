@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -234,7 +235,10 @@ func TestClientChannel_StartTyping(t *testing.T) {
 	stop() // should not panic
 }
 
-func TestSend_ClosedConnection(t *testing.T) {
+// A locally closed connection is redialed and the send goes out on the new
+// one (it used to fail at once with ErrSendFailed, which the channel manager
+// treats as permanent, so the reply was lost).
+func TestSend_ClosedConnectionReconnects(t *testing.T) {
 	srv := testServer(t, "")
 	defer srv.Close()
 
@@ -262,10 +266,10 @@ func TestSend_ClosedConnection(t *testing.T) {
 
 	_, err = ch.Send(ctx, bus.OutboundMessage{
 		ChatID:  "pico_client:sess-close",
-		Content: "should fail",
+		Content: "should reconnect",
 	})
-	if !errors.Is(err, channels.ErrSendFailed) {
-		t.Fatalf("expected ErrSendFailed, got %v", err)
+	if err != nil {
+		t.Fatalf("expected the send to wait for the reconnect, got %v", err)
 	}
 
 	ch.Stop(ctx)
@@ -621,5 +625,163 @@ func TestPicoClientChannel_HandleServerMessage_IgnoresLegacyThoughtBool(t *testi
 	case msg := <-mb.InboundChan():
 		t.Fatalf("expected no inbound publish for legacy thought payload, got %+v", msg)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestReconnectBackoff_JitteredAndCapped(t *testing.T) {
+	for n := 1; n <= 40; n++ {
+		d := min(reconnectBaseBackoff<<min(n-1, 15), reconnectMaxBackoff)
+		for range 50 {
+			got := reconnectBackoff(n)
+			if got < d/2 || got > d {
+				t.Fatalf("reconnectBackoff(%d) = %v, want within [%v, %v]", n, got, d/2, d)
+			}
+		}
+	}
+}
+
+// recyclingServer closes the first connection right after the upgrade with
+// 1012 (the driftwood relay's routine recycle), refuses dials for gap, then
+// accepts and records every message.send content on later connections.
+func recyclingServer(t *testing.T, gap time.Duration) (*httptest.Server, <-chan string) {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	got := make(chan string, 8)
+	var (
+		mu       sync.Mutex
+		conns    int
+		reopenAt time.Time
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n := conns
+		refuse := n == 1 && time.Now().Before(reopenAt)
+		if !refuse {
+			conns++
+		}
+		mu.Unlock()
+		if refuse {
+			http.Error(w, "recycling", http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if n == 0 {
+			mu.Lock()
+			reopenAt = time.Now().Add(gap)
+			mu.Unlock()
+			_ = conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseServiceRestart, "recycle"))
+			return
+		}
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg PicoMessage
+			if json.Unmarshal(raw, &msg) == nil && msg.Type == TypeMessageSend {
+				content, _ := msg.Payload[PayloadKeyContent].(string)
+				got <- content
+			}
+		}
+	}))
+	return srv, got
+}
+
+// A reply produced while the server is recycling the socket must park and go
+// out on the next connection, not fail with the permanent ErrSendFailed.
+func TestClientChannel_SendDuringRecycleWaitsForReconnect(t *testing.T) {
+	srv, got := recyclingServer(t, 700*time.Millisecond)
+	defer srv.Close()
+
+	bc := &config.Channel{Type: config.ChannelPicoClient, Enabled: true}
+	ch, err := NewPicoClientChannel(bc, &config.PicoClientSettings{
+		URL:         wsURL(srv.URL),
+		SessionID:   "sess-1",
+		ReadTimeout: 10,
+	}, bus.NewMessageBus())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err = ch.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer ch.Stop(ctx)
+
+	// Wait until the first connection is torn down: we are in the gap.
+	for {
+		ch.mu.Lock()
+		pc := ch.conn
+		ch.mu.Unlock()
+		if pc.closed.Load() {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("first connection never closed")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if _, err = ch.Send(ctx, bus.OutboundMessage{ChatID: "pico_client:sess-1", Content: "reply"}); err != nil {
+		t.Fatalf("Send during recycle: %v", err)
+	}
+	select {
+	case content := <-got:
+		if content != "reply" {
+			t.Fatalf("server got %q, want %q", content, "reply")
+		}
+	case <-ctx.Done():
+		t.Fatal("server never received the reply")
+	}
+}
+
+// With no connection coming back, Send gives up after sendReconnectWait with
+// ErrSendFailed instead of blocking forever.
+func TestClientChannel_SendGivesUpWhenServerStaysDown(t *testing.T) {
+	srv, _ := recyclingServer(t, time.Hour)
+	defer srv.Close()
+
+	old := sendReconnectWait
+	sendReconnectWait = 300 * time.Millisecond
+	defer func() { sendReconnectWait = old }()
+
+	bc := &config.Channel{Type: config.ChannelPicoClient, Enabled: true}
+	ch, err := NewPicoClientChannel(bc, &config.PicoClientSettings{
+		URL:         wsURL(srv.URL),
+		ReadTimeout: 10,
+	}, bus.NewMessageBus())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = ch.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer ch.Stop(ctx)
+
+	for {
+		ch.mu.Lock()
+		pc := ch.conn
+		ch.mu.Unlock()
+		if pc.closed.Load() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	start := time.Now()
+	_, err = ch.Send(ctx, bus.OutboundMessage{ChatID: "pico_client:x", Content: "lost"})
+	if !errors.Is(err, channels.ErrSendFailed) {
+		t.Fatalf("Send = %v, want ErrSendFailed", err)
+	}
+	if waited := time.Since(start); waited < 250*time.Millisecond {
+		t.Fatalf("Send gave up after %v, want it to wait ~sendReconnectWait", waited)
 	}
 }
