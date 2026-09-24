@@ -35,17 +35,67 @@ func isRecoverableEmptyResponse(resp *providers.LLMResponse) bool {
 }
 
 // refusalFailoverEligible reports whether a refusal should re-run on the
-// configured refusal failover model: an explicit refusal with no tool calls,
-// a failover model resolved on the agent, and the refusing model is not the
-// failover model itself (a refusal there surfaces as-is — no failover loop).
-func refusalFailoverEligible(agent *AgentInstance, resp *providers.LLMResponse, activeModel string) bool {
+// configured refusal failover model. All of these must hold:
+//   - an explicit refusal with no tool calls;
+//   - a failover model resolved on the agent;
+//   - the failover model is not already at the front of the chain (after a
+//     switch, or during a hold, the refusing primary sits at the tail);
+//   - the refusal came from the front candidate, not from a later fallback
+//     that answered after the front failed.
+//
+// Every other refusal surfaces as-is: a refusal from the failover model, a
+// refusal from a fallback when the front never refused, and a refusal from
+// the primary reached at the tail. So one call switches at most once, and a
+// hold never arms for a model that did not refuse.
+func refusalFailoverEligible(agent *AgentInstance, resp *providers.LLMResponse, exec *turnExecution) bool {
 	if resp == nil || resp.FinishReason != "refusal" || len(resp.ToolCalls) > 0 {
 		return false
 	}
-	if agent == nil || len(agent.RefusalFailoverCandidates) == 0 {
+	if agent == nil || len(agent.RefusalFailoverCandidates) == 0 || exec == nil {
 		return false
 	}
-	return activeModel != agent.RefusalFailoverCandidates[0].Model
+	failover := agent.RefusalFailoverCandidates[0]
+	if len(exec.activeCandidates) == 0 {
+		// No candidate list: the active model is the only one that can answer.
+		return exec.activeModel != failover.Model
+	}
+	front := exec.activeCandidates[0]
+	if front.StableKey() == failover.StableKey() {
+		return false
+	}
+	return exec.answeringKey == front.StableKey()
+}
+
+// refusalFailoverChain puts the refusal failover candidate first, keeps the
+// other fallbacks in their order, and moves the dropped front candidate (the
+// model that refused, or the primary during a hold) to the end, without
+// duplicates. An error from the failover model then still reaches the
+// original primary through the normal fallback chain.
+func refusalFailoverChain(
+	failover providers.FallbackCandidate,
+	candidates []providers.FallbackCandidate,
+) []providers.FallbackCandidate {
+	chain := make([]providers.FallbackCandidate, 0, len(candidates)+1)
+	seen := map[string]bool{failover.StableKey(): true}
+	chain = append(chain, failover)
+	add := func(candidate providers.FallbackCandidate) {
+		key := candidate.StableKey()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		chain = append(chain, candidate)
+	}
+	for i, candidate := range candidates {
+		if i == 0 {
+			continue
+		}
+		add(candidate)
+	}
+	if len(candidates) > 0 {
+		add(candidates[0])
+	}
+	return chain
 }
 
 // repointExecToCandidate switches the exec's candidate list, provider, and
@@ -106,23 +156,16 @@ func (p *Pipeline) escalateToFallbackModel(ts *turnState, exec *turnExecution) (
 }
 
 // switchToRefusalFailover fronts the refusal failover candidate so the next
-// attempt runs on it. The refusing lead candidate is dropped; the remaining
-// fallbacks stay behind the failover model (mirrors turn-start hold selection).
-// Returns the from/to model names and false when the exec could not be
-// repointed.
+// attempt runs on it. The remaining fallbacks stay behind the failover model,
+// and the refusing lead candidate moves to the end (mirrors turn-start hold
+// selection, see refusalFailoverChain). Returns the from/to model names and
+// false when the exec could not be repointed.
 func (p *Pipeline) switchToRefusalFailover(ts *turnState, exec *turnExecution) (string, string, bool) {
 	if exec == nil || ts == nil || ts.agent == nil || len(ts.agent.RefusalFailoverCandidates) == 0 {
 		return "", "", false
 	}
 	next := ts.agent.RefusalFailoverCandidates[0]
-	candidates := make([]providers.FallbackCandidate, 0, len(exec.activeCandidates)+1)
-	candidates = append(candidates, next)
-	for i, candidate := range exec.activeCandidates {
-		if i == 0 || candidate.StableKey() == next.StableKey() {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
+	candidates := refusalFailoverChain(next, exec.activeCandidates)
 	from := exec.activeModel
 	if !p.repointExecToCandidate(ts, exec, next, candidates) {
 		return "", "", false
@@ -267,6 +310,13 @@ func (p *Pipeline) CallLLM(
 
 	// LLM call closure with fallback support
 	callLLM := func(messagesForCall []providers.Message, toolDefsForCall []providers.ToolDefinition) (*providers.LLMResponse, error) {
+		// The single-candidate paths (configured streaming and the direct
+		// provider call) answer with the front candidate. The fallback chain
+		// below overwrites this with the candidate that actually answered.
+		exec.answeringKey = ""
+		if len(exec.activeCandidates) > 0 {
+			exec.answeringKey = exec.activeCandidates[0].StableKey()
+		}
 		providerCtx, providerCancel := context.WithCancel(turnCtx)
 		ts.setProviderCancel(providerCancel)
 		defer func() {
@@ -346,6 +396,7 @@ func (p *Pipeline) CallLLM(
 			if fbErr != nil {
 				return nil, fbErr
 			}
+			exec.answeringKey = fbResult.IdentityKey
 			if fbResult.Provider != "" && len(fbResult.Attempts) > 0 {
 				logger.InfoCF(
 					"agent",
@@ -438,7 +489,7 @@ func (p *Pipeline) CallLLM(
 			// next ones skip the refusing primary. Retry immediately — a refusal
 			// is not a load signal. A refusal from the failover model itself is
 			// not eligible and surfaces downstream unchanged.
-			if refusalFailoverEligible(ts.agent, exec.response, exec.activeModel) {
+			if refusalFailoverEligible(ts.agent, exec.response, exec) {
 				ts.agent.ArmRefusalHold(p.Cfg.Agents.Defaults.RefusalFailover.HoldDuration())
 				if retry < maxRetries {
 					if from, to, ok := p.switchToRefusalFailover(ts, exec); ok {

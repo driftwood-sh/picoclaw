@@ -222,10 +222,11 @@ func TestRefusalHoldFrontsFailoverCandidatesUntilExpiry(t *testing.T) {
 	if model != "openai/failover-model" {
 		t.Fatalf("model under hold = %q, want openai/failover-model", model)
 	}
-	if len(candidates) != 2 ||
+	if len(candidates) != 3 ||
 		candidates[0].Model != "openai/failover-model" ||
-		candidates[1].Model != "openai/fallback-model" {
-		t.Fatalf("hold candidates = %v, want failover fronted with the primary dropped", candidates)
+		candidates[1].Model != "openai/fallback-model" ||
+		candidates[2].Model != "openai/test-model" {
+		t.Fatalf("hold candidates = %v, want [failover, fallback, primary]: failover fronted, primary last", candidates)
 	}
 
 	agent.refusalHold.mu.Lock()

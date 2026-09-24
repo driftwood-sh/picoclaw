@@ -148,6 +148,11 @@ type turnExecution struct {
 	gracefulTerminal    bool
 	useNativeSearch     bool
 
+	// answeringKey is the StableKey of the candidate that produced response.
+	// On the multi-candidate path a later fallback can answer, so the front
+	// candidate (activeCandidates[0]) is not always the model that answered.
+	answeringKey string
+
 	// Phase tracking
 	phase LLMPhase
 

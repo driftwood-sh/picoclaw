@@ -336,10 +336,12 @@ func (al *AgentLoop) selectCandidates(
 }
 
 // refusalHoldSelection fronts the refusal failover model while the agent's
-// refusal hold is armed, so turns skip a primary that is currently refusing.
-// The primary (Candidates[0]) is dropped for the window; the remaining
-// fallbacks stay behind the failover model. Pass-through when refusal failover
-// is not configured or the hold is inactive.
+// refusal hold is armed, so turns start away from a primary that is currently
+// refusing. The remaining fallbacks stay behind the failover model, and the
+// primary (Candidates[0]) moves to the end of the chain for the window, so an
+// error from the failover model still reaches it. A refusal from the primary
+// there surfaces as-is (see refusalFailoverEligible). Pass-through when
+// refusal failover is not configured or the hold is inactive.
 func refusalHoldSelection(
 	agent *AgentInstance,
 	candidates []providers.FallbackCandidate,
@@ -353,14 +355,7 @@ func refusalHoldSelection(
 		return candidates, model
 	}
 	failover := agent.RefusalFailoverCandidates[0]
-	fronted := make([]providers.FallbackCandidate, 0, len(candidates))
-	fronted = append(fronted, failover)
-	for i, candidate := range candidates {
-		if i == 0 || candidate.StableKey() == failover.StableKey() {
-			continue
-		}
-		fronted = append(fronted, candidate)
-	}
+	fronted := refusalFailoverChain(failover, candidates)
 	logger.InfoCF("agent", "Refusal hold active; starting turn on failover model",
 		map[string]any{
 			"agent_id":       agent.ID,

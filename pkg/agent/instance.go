@@ -71,7 +71,7 @@ type AgentInstance struct {
 	// until the stored instant. Held behind a pointer so the shallow agent
 	// copies made for SubTurns share one hold with the registry instance.
 	// In-memory by design: a gateway restart clears the hold, and the next
-	// refusal from the primary simply re-arms it.
+	// refusal from the primary at the front of the chain re-arms it.
 	refusalHold *refusalHoldState
 }
 
