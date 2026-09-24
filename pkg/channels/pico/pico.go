@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime"
 	"net/http"
@@ -27,6 +28,10 @@ import (
 )
 
 // picoConn represents a single WebSocket connection.
+// errConnClosed is returned by writeJSON on a connection that is already
+// closed. Nothing was written, so the caller may safely resend elsewhere.
+var errConnClosed = errors.New("connection closed")
+
 type picoConn struct {
 	id        string
 	conn      *websocket.Conn
@@ -74,7 +79,7 @@ func outboundMessageFinalizesTrackedToolFeedback(msg bus.OutboundMessage) bool {
 // writeJSON sends a JSON message to the connection with write locking.
 func (pc *picoConn) writeJSON(v any) error {
 	if pc.closed.Load() {
-		return fmt.Errorf("connection closed")
+		return errConnClosed
 	}
 	pc.writeMu.Lock()
 	defer pc.writeMu.Unlock()
