@@ -474,6 +474,160 @@ func TestParseResponseBody_Refusal(t *testing.T) {
 	if result.Content != "I cannot help with that." {
 		t.Errorf("Content = %q, want %q", result.Content, "I cannot help with that.")
 	}
+	if result.FinishReason != "refusal" {
+		t.Errorf("FinishReason = %q, want %q", result.FinishReason, "refusal")
+	}
+	if len(result.ToolCalls) != 0 {
+		t.Errorf("len(ToolCalls) = %d, want 0", len(result.ToolCalls))
+	}
+}
+
+func TestParseResponseBody_RefusalAfterOutputText(t *testing.T) {
+	body := strings.NewReader(fmt.Sprintf(`{
+		"id": "resp_ref_mixed",
+		"object": "response",
+		"status": "%s",
+		"output": [
+			{
+				"type": "reasoning",
+				"id": "rs_1",
+				"summary": [{"type": "summary_text", "text": "Considering the request."}]
+			},
+			{
+				"type": "message",
+				"content": [
+					{"type": "output_text", "text": "Partial answer. "},
+					{"type": "refusal", "refusal": "I can't continue with this."}
+				]
+			}
+		],
+		"usage": {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`, string(responses.ResponseStatusCompleted)))
+
+	result, err := ParseResponseBody(body)
+	if err != nil {
+		t.Fatalf("ParseResponseBody error: %v", err)
+	}
+	if result.FinishReason != "refusal" {
+		t.Errorf("FinishReason = %q, want %q", result.FinishReason, "refusal")
+	}
+	if want := "Partial answer. I can't continue with this."; result.Content != want {
+		t.Errorf("Content = %q, want %q", result.Content, want)
+	}
+}
+
+func TestParseResponseBody_RefusalWithFunctionCallIsToolCalls(t *testing.T) {
+	body := strings.NewReader(fmt.Sprintf(`{
+		"id": "resp_ref_tool",
+		"object": "response",
+		"status": "%s",
+		"output": [
+			{
+				"type": "message",
+				"content": [{"type": "refusal", "refusal": "I won't do part of that."}]
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_xyz",
+				"name": "read_file",
+				"arguments": "{\"path\":\"README.md\"}"
+			}
+		],
+		"usage": {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`, string(responses.ResponseStatusCompleted)))
+
+	result, err := ParseResponseBody(body)
+	if err != nil {
+		t.Fatalf("ParseResponseBody error: %v", err)
+	}
+	if result.FinishReason != "tool_calls" {
+		t.Errorf("FinishReason = %q, want %q (tool calls win over a refusal part)", result.FinishReason, "tool_calls")
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_file" {
+		t.Errorf("ToolCalls = %+v, want one read_file call", result.ToolCalls)
+	}
+	if result.Content != "I won't do part of that." {
+		t.Errorf("Content = %q, want the refusal text kept", result.Content)
+	}
+}
+
+func TestParseResponseBody_RefusalWithIncompleteStatusKeepsLength(t *testing.T) {
+	body := strings.NewReader(fmt.Sprintf(`{
+		"id": "resp_ref_inc",
+		"object": "response",
+		"status": "%s",
+		"output": [
+			{
+				"type": "message",
+				"content": [{"type": "refusal", "refusal": "I cannot"}]
+			}
+		],
+		"usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`, string(responses.ResponseStatusIncomplete)))
+
+	result, err := ParseResponseBody(body)
+	if err != nil {
+		t.Fatalf("ParseResponseBody error: %v", err)
+	}
+	if result.FinishReason != "length" {
+		t.Errorf("FinishReason = %q, want %q (response status wins)", result.FinishReason, "length")
+	}
+}
+
+func TestParseResponseBody_RefusalWithFailedStatusKeepsError(t *testing.T) {
+	body := strings.NewReader(fmt.Sprintf(`{
+		"id": "resp_ref_fail",
+		"object": "response",
+		"status": "%s",
+		"output": [
+			{
+				"type": "message",
+				"content": [{"type": "refusal", "refusal": "I cannot"}]
+			}
+		],
+		"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`, string(responses.ResponseStatusFailed)))
+
+	result, err := ParseResponseBody(body)
+	if err != nil {
+		t.Fatalf("ParseResponseBody error: %v", err)
+	}
+	if result.FinishReason != "error" {
+		t.Errorf("FinishReason = %q, want %q (response status wins)", result.FinishReason, "error")
+	}
+}
+
+func TestParseResponseFromStruct_Refusal(t *testing.T) {
+	var resp responses.Response
+	if err := json.Unmarshal([]byte(`{
+		"id": "resp_struct_ref",
+		"object": "response",
+		"status": "completed",
+		"output": [
+			{
+				"type": "message",
+				"content": [{"type": "refusal", "refusal": "No."}]
+			}
+		]
+	}`), &resp); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	result := ParseResponseFromStruct(&resp)
+	if result.FinishReason != "refusal" {
+		t.Errorf("FinishReason = %q, want %q", result.FinishReason, "refusal")
+	}
+	if result.Content != "No." {
+		t.Errorf("Content = %q, want %q", result.Content, "No.")
+	}
 }
 
 func TestParseResponseBody_IncompleteStatus(t *testing.T) {

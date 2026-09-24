@@ -217,6 +217,7 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 	var content strings.Builder
 	var reasoningContent strings.Builder
 	var toolCalls []protocoltypes.ToolCall
+	refused := false
 
 	for _, item := range apiResp.Output {
 		switch item.Type {
@@ -226,7 +227,12 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 				case "output_text":
 					content.WriteString(c.Text)
 				case "refusal":
+					// The Responses API reports a safety refusal as a
+					// {"type":"refusal","refusal":"<text>"} content part on an
+					// otherwise completed response. Keep the text visible and
+					// remember the refusal for FinishReason below.
 					content.WriteString(c.Refusal)
+					refused = true
 				}
 			}
 		case "function_call":
@@ -246,9 +252,17 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 		}
 	}
 
+	// Tool calls win over a refusal part: the turn still has work to run.
+	// A refusal with no tool calls maps to "refusal", the same value the
+	// Anthropic Messages provider sets, so the agent's refusal_failover
+	// applies to Responses API models too. A failed, incomplete or canceled
+	// status still overrides both below.
 	finishReason := "stop"
-	if len(toolCalls) > 0 {
+	switch {
+	case len(toolCalls) > 0:
 		finishReason = "tool_calls"
+	case refused:
+		finishReason = "refusal"
 	}
 	switch apiResp.Status {
 	case responses.ResponseStatusIncomplete:
