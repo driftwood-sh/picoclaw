@@ -33,6 +33,14 @@ const (
 	// reconnectPollInterval is a safety net only: a dropped connection wakes
 	// reconnectLoop at once through the redial channel.
 	reconnectPollInterval = 1 * time.Second
+	// Every redial first waits a jittered redialMinDelay..redialMaxDelay, so
+	// a flapping connection can never become a hot loop.
+	redialMinDelay = 250 * time.Millisecond
+	redialMaxDelay = 750 * time.Millisecond
+	// A connection that lived less than this counts as a failed dial for
+	// backoff. Example: two gateway processes with one token, where the
+	// server's register closes the other's socket on every dial.
+	minStableConnection = 5 * time.Second
 )
 
 // sendReconnectWait is how long Send parks on a dropped connection, waiting
@@ -166,6 +174,11 @@ func reconnectBackoff(n int) time.Duration {
 	return half + rand.N(half+1)
 }
 
+// redialDelay is the jittered wait before any redial.
+func redialDelay() time.Duration {
+	return redialMinDelay + rand.N(redialMaxDelay-redialMinDelay+1)
+}
+
 // liveConn returns the current open connection, parking up to
 // sendReconnectWait for reconnectLoop to install one if it is down.
 func (c *PicoClientChannel) liveConn(ctx context.Context) (*picoConn, error) {
@@ -190,10 +203,13 @@ func (c *PicoClientChannel) liveConn(ctx context.Context) (*picoConn, error) {
 	}
 }
 
-// reconnectLoop re-dials as soon as the connection drops, with jittered
-// exponential backoff while dials keep failing.
+// reconnectLoop re-dials soon after the connection drops (a short jittered
+// delay), with jittered exponential backoff while dials keep failing or
+// connections keep dying young.
 func (c *PicoClientChannel) reconnectLoop() {
 	failures := 0
+	// Start dialed just before this loop runs.
+	connectedAt := time.Now()
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -206,23 +222,34 @@ func (c *PicoClientChannel) reconnectLoop() {
 		c.mu.Unlock()
 
 		if pc == nil || pc.closed.Load() {
+			if !connectedAt.IsZero() {
+				// Judge the connection that just ended exactly once.
+				if time.Since(connectedAt) < minStableConnection {
+					failures++
+				} else {
+					failures = 0
+				}
+				connectedAt = time.Time{}
+			}
+			wait := redialDelay()
+			if failures > 0 {
+				wait = max(wait, reconnectBackoff(failures))
+			}
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(wait):
+			}
 			logger.InfoC("pico_client", "Reconnecting...")
 			if err := c.dial(); err != nil {
 				failures++
-				backoff := reconnectBackoff(failures)
 				logger.WarnCF("pico_client", "Reconnect failed", map[string]any{
 					"error":   err.Error(),
 					"attempt": failures,
-					"backoff": backoff.String(),
 				})
-				select {
-				case <-c.ctx.Done():
-					return
-				case <-time.After(backoff):
-				}
 				continue
 			}
-			failures = 0
+			connectedAt = time.Now()
 			logger.InfoC("pico_client", "Reconnected")
 		}
 

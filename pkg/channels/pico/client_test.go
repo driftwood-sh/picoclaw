@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -783,5 +784,47 @@ func TestClientChannel_SendGivesUpWhenServerStaysDown(t *testing.T) {
 	}
 	if waited := time.Since(start); waited < 250*time.Millisecond {
 		t.Fatalf("Send gave up after %v, want it to wait ~sendReconnectWait", waited)
+	}
+}
+
+// Two gateway processes sharing one token kick each other off: the server
+// closes every connection right after the upgrade. The client must back off
+// instead of redialing in a hot loop (one DB lookup per dial server-side).
+func TestClientChannel_FlappingConnectionBacksOff(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var dials atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		dials.Add(1)
+		_ = conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseServiceRestart, "replaced"))
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	bc := &config.Channel{Type: config.ChannelPicoClient, Enabled: true}
+	ch, err := NewPicoClientChannel(bc, &config.PicoClientSettings{
+		URL:         wsURL(srv.URL),
+		ReadTimeout: 10,
+	}, bus.NewMessageBus())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = ch.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+	_ = ch.Stop(ctx)
+
+	// Each flap counts as a failure: waits of >=250 ms, then 0.25-0.5 s,
+	// 0.5-1 s, 1-2 s ... allow at most 8 dials in 3 s. A hot loop makes
+	// hundreds.
+	if n := dials.Load(); n < 2 || n > 8 {
+		t.Fatalf("%d dials in 3s; want 2..8 (backed off, but still redialing)", n)
 	}
 }
