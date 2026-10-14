@@ -5,11 +5,32 @@ package agent
 import (
 	"fmt"
 
+	"github.com/google/uuid"
+	"github.com/sipeed/picoclaw/pkg/bus"
+
 	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
 )
 
 func (al *AgentLoop) newTurnEventScope(agentID, sessionKey string, turnCtx *TurnContext) turnEventScope {
 	seq := al.turnSeq.Add(1)
+	turnCtx = cloneTurnContext(turnCtx)
+	if turnCtx == nil {
+		turnCtx = &TurnContext{}
+	}
+	if turnCtx.Inbound == nil {
+		turnCtx.Inbound = &bus.InboundContext{}
+	}
+	if turnCtx.Inbound.Raw == nil {
+		turnCtx.Inbound.Raw = make(map[string]string)
+	}
+	if turnCtx.Inbound.Raw["workflow_id"] == "" {
+		in := turnCtx.Inbound
+		id := uuid.NewString()
+		if in.MessageID != "" {
+			id = uuid.NewSHA1(uuid.NameSpaceURL, []byte(in.Channel+":"+in.ChatID+":"+in.MessageID)).String()
+		}
+		in.Raw["workflow_id"] = id
+	}
 	return turnEventScope{
 		agentID:    agentID,
 		sessionKey: sessionKey,
@@ -19,7 +40,7 @@ func (al *AgentLoop) newTurnEventScope(agentID, sessionKey string, turnCtx *Turn
 }
 
 func (ts turnEventScope) meta(iteration int, source, tracePath string) HookMeta {
-	return HookMeta{
+	meta := HookMeta{
 		AgentID:     ts.agentID,
 		TurnID:      ts.turnID,
 		SessionKey:  ts.sessionKey,
@@ -28,6 +49,11 @@ func (ts turnEventScope) meta(iteration int, source, tracePath string) HookMeta 
 		TracePath:   tracePath,
 		turnContext: cloneTurnContext(ts.context),
 	}
+	if ts.context != nil && ts.context.Inbound != nil {
+		meta.WorkflowID = ts.context.Inbound.Raw["workflow_id"]
+		meta.ParentTurnID = ts.context.Inbound.Raw["parent_turn_id"]
+	}
+	return meta
 }
 
 func (al *AgentLoop) emitEvent(kind runtimeevents.Kind, meta HookMeta, payload any) {

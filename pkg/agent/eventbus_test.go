@@ -672,6 +672,17 @@ func TestAgentLoop_EmitsFollowUpQueuedEvent(t *testing.T) {
 	if followUpEvt.Scope.TurnID == "" {
 		t.Fatal("expected follow-up event to include turn id")
 	}
+	select {
+	case msg := <-msgBus.InboundChan():
+		if msg.Context.Raw["workflow_id"] == "" || msg.Context.Raw["workflow_id"] != followUpEvt.Correlation.WorkflowID {
+			t.Fatal("async callback lost workflow identity")
+		}
+		if msg.Context.Raw["parent_turn_id"] != followUpEvt.Scope.TurnID {
+			t.Fatal("async callback lost parent turn")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing async callback")
+	}
 }
 
 func receiveRuntimeEvent(t *testing.T, ch <-chan runtimeevents.Event) runtimeevents.Event {

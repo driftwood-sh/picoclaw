@@ -94,6 +94,7 @@ type LLMHookRequest struct {
 	Meta             HookMeta                   `json:"meta"`
 	Context          *TurnContext               `json:"context,omitempty"`
 	Model            string                     `json:"model"`
+	Fallbacks        []string                   `json:"fallbacks,omitempty"`
 	Messages         []providers.Message        `json:"messages,omitempty"`
 	Tools            []providers.ToolDefinition `json:"tools,omitempty"`
 	Options          map[string]any             `json:"options,omitempty"`
@@ -106,6 +107,9 @@ func (r *LLMHookRequest) Clone() *LLMHookRequest {
 	}
 	cloned := *r
 	cloned.Meta = cloneHookMeta(r.Meta)
+	if r.Fallbacks != nil {
+		cloned.Fallbacks = append([]string{}, r.Fallbacks...)
+	}
 	cloned.Context = cloneTurnContext(r.Context)
 	cloned.Messages = cloneProviderMessages(r.Messages)
 	cloned.Tools = cloneToolDefinitions(r.Tools)

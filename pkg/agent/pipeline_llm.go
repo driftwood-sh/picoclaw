@@ -261,8 +261,8 @@ func (p *Pipeline) CallLLM(
 				if !nativeSearchAllowed {
 					delete(exec.llmOpts, "native_search")
 				}
-				if strings.TrimSpace(exec.llmModel) != "" && exec.llmModel != prevModel {
-					p.applyBeforeLLMModelRewrite(ts, exec)
+				if strings.TrimSpace(exec.llmModel) != "" && (exec.llmModel != prevModel || llmReq.Fallbacks != nil) {
+					p.applyBeforeLLMModelRewrite(ts, exec, llmReq.Fallbacks)
 					applyTurnThinkingOptions(exec, ts.agent, exec.activeProvider, true)
 				}
 			}
@@ -929,7 +929,7 @@ func (p *Pipeline) CallLLM(
 	return ControlToolLoop, nil
 }
 
-func (p *Pipeline) applyBeforeLLMModelRewrite(ts *turnState, exec *turnExecution) {
+func (p *Pipeline) applyBeforeLLMModelRewrite(ts *turnState, exec *turnExecution, fallbacks []string) {
 	if p == nil || ts == nil || ts.agent == nil || exec == nil {
 		return
 	}
@@ -945,7 +945,7 @@ func (p *Pipeline) applyBeforeLLMModelRewrite(ts *turnState, exec *turnExecution
 		}
 	}
 	defaultProvider = effectiveDefaultProvider(defaultProvider)
-	candidates := resolveModelCandidates(p.Cfg, defaultProvider, rawModel, nil)
+	candidates := resolveModelCandidates(p.Cfg, defaultProvider, rawModel, fallbacks)
 	exec.activeCandidates = candidates
 	exec.activeModel = resolvedCandidateModel(candidates, rawModel)
 	exec.llmModel = exec.activeModel

@@ -550,6 +550,10 @@ toolLoop:
 					ChatID:   fmt.Sprintf("%s:%s", ts.channel, ts.chatID),
 					ChatType: "direct",
 					SenderID: fmt.Sprintf("async:%s", asyncToolName),
+					Raw: map[string]string{
+						"workflow_id":    ts.eventMeta("", "").WorkflowID,
+						"parent_turn_id": ts.turnID,
+					},
 				},
 				Content: content,
 			})

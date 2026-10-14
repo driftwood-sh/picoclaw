@@ -56,6 +56,7 @@ type Scope struct {
 
 // Correlation carries cross-event tracing fields.
 type Correlation struct {
+	WorkflowID   string `json:"workflow_id,omitempty"`
 	TraceID      string `json:"trace_id,omitempty"`
 	ParentTurnID string `json:"parent_turn_id,omitempty"`
 	RequestID    string `json:"request_id,omitempty"`

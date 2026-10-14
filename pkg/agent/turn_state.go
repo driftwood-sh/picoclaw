@@ -259,6 +259,9 @@ type turnState struct {
 // =============================================================================
 
 func newTurnState(agent *AgentInstance, opts processOptions, scope turnEventScope) *turnState {
+	if scope.context != nil {
+		opts.Dispatch.InboundContext = cloneInboundContext(scope.context.Inbound)
+	}
 	ts := &turnState{
 		agent:        agent,
 		opts:         opts,
@@ -636,15 +639,12 @@ func (ts *turnState) hardAbortRequested() bool {
 
 func (ts *turnState) eventMeta(source, tracePath string) HookMeta {
 	snap := ts.snapshot()
-	return HookMeta{
-		AgentID:     snap.AgentID,
-		TurnID:      snap.TurnID,
-		SessionKey:  snap.SessionKey,
-		Iteration:   snap.Iteration,
-		Source:      source,
-		TracePath:   tracePath,
-		turnContext: cloneTurnContext(ts.turnCtx),
+	meta := ts.scope.meta(snap.Iteration, source, tracePath)
+	if snap.ParentTurnID != "" {
+		meta.ParentTurnID = snap.ParentTurnID
 	}
+	meta.turnContext = cloneTurnContext(ts.turnCtx)
+	return meta
 }
 
 func (ts *turnState) captureRestorePoint(history []providers.Message, summary string) {

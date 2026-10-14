@@ -12,6 +12,7 @@ type HookMeta struct {
 	AgentID      string
 	TurnID       string
 	ParentTurnID string
+	WorkflowID   string
 	SessionKey   string
 	Iteration    int
 	TracePath    string

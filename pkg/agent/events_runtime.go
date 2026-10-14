@@ -36,6 +36,7 @@ func runtimeScopeFromHookMeta(meta HookMeta, eventCtx *TurnContext) runtimeevent
 
 func runtimeCorrelationFromHookMeta(meta HookMeta) runtimeevents.Correlation {
 	return runtimeevents.Correlation{
+		WorkflowID:   meta.WorkflowID,
 		TraceID:      meta.TracePath,
 		ParentTurnID: meta.ParentTurnID,
 	}
