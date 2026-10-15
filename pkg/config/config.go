@@ -453,6 +453,7 @@ type AgentDefaults struct {
 	SummarizeMessageThreshold int                    `json:"summarize_message_threshold"      env:"PICOCLAW_AGENTS_DEFAULTS_SUMMARIZE_MESSAGE_THRESHOLD"`
 	SummarizeTokenPercent     int                    `json:"summarize_token_percent"          env:"PICOCLAW_AGENTS_DEFAULTS_SUMMARIZE_TOKEN_PERCENT"`
 	MaxMediaSize              int                    `json:"max_media_size,omitempty"         env:"PICOCLAW_AGENTS_DEFAULTS_MAX_MEDIA_SIZE"`
+	MemoryMaxBytes            int                    `json:"memory_max_bytes,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_MEMORY_MAX_BYTES"`
 	Routing                   *RoutingConfig         `json:"routing,omitempty"`
 	SteeringMode              string                 `json:"steering_mode,omitempty"          env:"PICOCLAW_AGENTS_DEFAULTS_STEERING_MODE"`      // "one-at-a-time" (default) or "all"
 	MaxParallelTurns          int                    `json:"max_parallel_turns,omitempty"     env:"PICOCLAW_AGENTS_DEFAULTS_MAX_PARALLEL_TURNS"` // Max concurrent turns (0 or 1 = sequential)
@@ -474,6 +475,20 @@ func (d *AgentDefaults) GetMaxMediaSize() int {
 		return d.MaxMediaSize
 	}
 	return DefaultMaxMediaSize
+}
+
+// DefaultMemoryMaxBytes is the per-block budget for workspace memory injected
+// into every request: memory/MEMORY.md and the recent daily notes are each
+// capped at this many bytes.
+const DefaultMemoryMaxBytes = 32 * 1024 // 32 KB
+
+// GetMemoryMaxBytes returns the injection budget for MEMORY.md and for the
+// recent daily notes (each). Unset or non-positive values use the default.
+func (d *AgentDefaults) GetMemoryMaxBytes() int {
+	if d.MemoryMaxBytes > 0 {
+		return d.MemoryMaxBytes
+	}
+	return DefaultMemoryMaxBytes
 }
 
 // GetToolFeedbackMaxArgsLength returns the max visible text length for tool argument previews.

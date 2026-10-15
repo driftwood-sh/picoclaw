@@ -117,6 +117,10 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
 	}
 
 	if !ts.opts.NoHistory && (strings.TrimSpace(ts.userMessage) != "" || len(ts.media) > 0) {
+		// Persist exactly the user message BuildMessagesFromPrompt sent (the
+		// runtime context travels in the unpersisted turn context message), so
+		// later turns re-send this message byte-for-byte and the provider
+		// prefix cache keeps matching through it.
 		rootMsg := userPromptMessage(ts.userMessage, ts.media)
 		if len(rootMsg.Media) > 0 {
 			ts.agent.Sessions.AddFullMessage(ts.sessionKey, rootMsg)

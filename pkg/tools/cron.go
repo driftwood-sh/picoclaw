@@ -16,6 +16,11 @@ import (
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
+// CronSessionKeyPrefix starts the session key of every cron run. Each run gets
+// a fresh session (prefix + job ID + random UUID) that is never read again, so
+// the agent loop skips post-turn summarization for these keys.
+const CronSessionKeyPrefix = "agent:cron-"
+
 // JobExecutor is the interface for executing cron jobs through the agent
 type JobExecutor interface {
 	ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID string) (string, error)
@@ -641,7 +646,7 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 		return "ok"
 	}
 
-	sessionKey := fmt.Sprintf("agent:cron-%s-%s", job.ID, uuid.New().String())
+	sessionKey := fmt.Sprintf("%s%s-%s", CronSessionKeyPrefix, job.ID, uuid.New().String())
 
 	// Call agent with the job message
 	response, err := t.executor.ProcessDirectWithChannel(

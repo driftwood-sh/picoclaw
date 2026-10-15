@@ -638,6 +638,9 @@ func (p *Pipeline) CallLLM(
 				fullHistory := append(append([]providers.Message(nil), trimmedHistory...), protectedTurnTail...)
 				rebuildPromptReq := promptBuildRequestForTurn(ts, fullHistory, exec.summary, "", nil, p.Cfg)
 				rebuildPromptReq.ActiveSkills = append([]string(nil), contextualSkills...)
+				// Keep the turn context message before this turn's own
+				// messages, where it sat on the turn's first call.
+				rebuildPromptReq.CurrentTurnHistory = len(protectedTurnTail)
 				rebuilt := ts.agent.ContextBuilder.BuildMessagesFromPrompt(rebuildPromptReq)
 				return resolveMediaRefs(
 					rebuilt,

@@ -58,6 +58,31 @@ func TestConvertMessages_UserMessage(t *testing.T) {
 	assert.Equal(t, "What is 2+2?", textBlock.Value)
 }
 
+// TestConvertMessages_ConsecutiveUserMessagesMerged: Converse requires the
+// roles to alternate, so a turn context message followed by the user's own
+// message must reach Bedrock as one user message carrying both text blocks.
+func TestConvertMessages_ConsecutiveUserMessagesMerged(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: "earlier"},
+		{Role: "assistant", Content: "reply"},
+		{Role: "user", Content: "[turn context] memory"},
+		{Role: "user", Content: "current question"},
+	}
+
+	bedrockMsgs, _ := convertMessages(messages)
+
+	require.Len(t, bedrockMsgs, 3)
+	last := bedrockMsgs[2]
+	assert.Equal(t, types.ConversationRoleUser, last.Role)
+	require.Len(t, last.Content, 2)
+	first, ok := last.Content[0].(*types.ContentBlockMemberText)
+	require.True(t, ok)
+	assert.Equal(t, "[turn context] memory", first.Value)
+	second, ok := last.Content[1].(*types.ContentBlockMemberText)
+	require.True(t, ok)
+	assert.Equal(t, "current question", second.Value)
+}
+
 func TestConvertMessages_AssistantMessage(t *testing.T) {
 	messages := []Message{
 		{Role: "assistant", Content: "The answer is 4."},

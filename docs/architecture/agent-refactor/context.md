@@ -19,10 +19,24 @@ The context window is the model's total input capacity. Four regions fill it:
 
 | Region | Assembled by | Stored in session? |
 |---|---|---|
-| System prompt | `BuildMessages()` — static + dynamic parts | No |
-| Summary | `SetSummary()` stores it; `BuildMessages()` injects it | Separate from history |
+| System prompt | `BuildMessages()` — static parts only (identity, workspace files, skills) | No |
+| Turn context | `BuildMessages()` — one user-role message before the current turn: workspace memory, summary, runtime context | No (rebuilt every turn) |
+| Summary | `SetSummary()` stores it; `BuildMessages()` injects it into the turn context | Separate from history |
 | Session history | User / assistant / tool messages | Yes |
 | Tool definitions | Provider adapter injects at call time | No |
+
+Request layout: `[system] [history…] [turn context] [current user message]`.
+The system prompt holds only content that changes when the persona changes;
+memory and the summary change between turns, so they travel in the turn
+context message instead. That keeps the system prompt a byte-stable cache
+prefix (OpenAI's Responses API caches by prefix: any change inside
+`instructions` re-bills the whole request). The runtime context (time,
+session, sender) is the last block of the turn context message, so the
+current user message is sent exactly as it is stored and re-serializes
+byte-identically on later turns.
+MEMORY.md and the recent daily notes are each capped at
+`agents.defaults.memory_max_bytes` (default 32 KB); over budget, the agent
+sees the start and the end of the file plus a notice to shrink it.
 
 `MaxTokens` (the output generation limit) must also be reserved from the total budget.
 
@@ -59,6 +73,7 @@ Session history does **not** contain:
 
 - System prompts — assembled at request time by `BuildMessages`
 - Summary content — stored separately via `SetSummary`, injected by `BuildMessages`
+- The turn context message — rebuilt by `BuildMessages` on every turn, never persisted
 
 This distinction matters: any code that operates on session history — compression, boundary detection, token estimation — must not assume a system message is present.
 
@@ -87,7 +102,7 @@ Three compression paths exist, in order of preference:
 
 `maybeSummarize` runs after each Turn completes.
 
-Triggers when message count exceeds a threshold, or when estimated history tokens exceed a percentage of `ContextWindow`. If triggered, a background goroutine calls the LLM to produce a summary of the oldest messages. The summary is stored via `SetSummary`; `BuildMessages` injects it into the system prompt on the next call.
+Triggers when message count exceeds a threshold, or when estimated history tokens exceed a percentage of `ContextWindow`. If triggered, a background goroutine calls the LLM to produce a summary of the oldest messages. The summary is stored via `SetSummary`; `BuildMessages` injects it into the turn context message on the next call.
 
 Cut point uses `findSafeBoundary` so no Turn is split.
 
@@ -105,7 +120,7 @@ This prevents wasted (and billed) LLM calls that would otherwise fail with a con
 
 Drops the oldest ~50% of Turns. If the history is a single Turn with no safe split point (e.g. one user message followed by a massive tool response), falls back to keeping only the most recent user message — breaking Turn atomicity as a last resort to avoid a context-exceeded loop.
 
-Stores a compression note in the session summary (not in history messages) so `BuildMessages` can include it in the next system prompt.
+Stores a compression note in the session summary (not in history messages) so `BuildMessages` can include it in the next turn context message.
 
 This is the fallback for when the token estimate undershoots reality.
 

@@ -66,6 +66,16 @@ func (cb *ContextBuilder) WithToolDiscovery(useBM25, useRegex bool) *ContextBuil
 	return cb
 }
 
+// WithMemoryMaxBytes sets the injection budget for workspace memory
+// (agents.defaults.memory_max_bytes), applied to MEMORY.md and to the recent
+// daily notes separately.
+func (cb *ContextBuilder) WithMemoryMaxBytes(n int) *ContextBuilder {
+	if cb.memory != nil {
+		cb.memory.SetMaxBytes(n)
+	}
+	return cb
+}
+
 func (cb *ContextBuilder) WithSplitOnMarker(enabled bool) *ContextBuilder {
 	cb.splitOnMarker = enabled
 	return cb
@@ -220,23 +230,6 @@ func (cb *ContextBuilder) BuildSystemPrompt() string {
 	return renderPromptPartsLegacy(cb.BuildSystemPromptParts())
 }
 
-// buildMemoryPromptPart wraps workspace memory as the final system block.
-// Ephemeral cache marker on purpose: memory is the churn hotspot of the
-// system prefix, and the marker localizes each edit's cache rewrite to this
-// block (everything before it keeps reading from cache).
-func buildMemoryPromptPart(memoryContext string) PromptPart {
-	return PromptPart{
-		ID:      "context.memory",
-		Layer:   PromptLayerContext,
-		Slot:    PromptSlotMemory,
-		Source:  PromptSource{ID: PromptSourceMemory, Name: "memory:workspace"},
-		Title:   "memory",
-		Content: "# Memory\n\n" + memoryContext,
-		Stable:  true,
-		Cache:   PromptCacheEphemeral,
-	}
-}
-
 func (cb *ContextBuilder) BuildSystemPromptParts() []PromptPart {
 	return cb.buildSystemPromptParts(systemPromptBuildOptions{
 		IncludeSkillCatalog: true,
@@ -322,12 +315,11 @@ func (cb *ContextBuilder) buildSystemPromptParts(opts systemPromptBuildOptions) 
 		})
 	}
 
-	// Workspace memory is deliberately NOT part of these parts: agents edit
-	// their memory file constantly, and memory content at the front of the
-	// prompt invalidated the entire provider-side prompt cache (system +
-	// skills + everything downstream) on every edit. BuildMessagesFromPrompt
-	// appends memory as the LAST system block with its own cache marker, so
-	// an edit rewrites only the memory span. See buildMemoryPromptPart.
+	// Workspace memory is deliberately NOT part of the system prompt: agents
+	// edit their memory file constantly, and any change inside the system
+	// prompt invalidates the provider-side prompt cache for the whole
+	// request. BuildMessagesFromPrompt sends memory in the per-turn context
+	// message placed just before the current turn (turnContextPromptMessage).
 
 	// Multi-Message Sending (if enabled)
 	if cb.splitOnMarker {
@@ -483,10 +475,10 @@ func xmlEscapeForPrompt(s string) string {
 	return replacer.Replace(s)
 }
 
-// EstimateSystemTokens estimates the token count of the full system message
+// EstimateSystemTokens estimates the token count of the fixed prompt overhead
 // that would be sent to the LLM, mirroring the composition logic in BuildMessages.
-// It includes: static prompt, dynamic context, active skills, and summary with
-// wrapping prefixes and separators. This avoids needing all per-request parameters
+// It includes: static prompt, dynamic context, active skills, and the per-turn
+// context message (memory and summary) with wrapping prefixes and separators. This avoids needing all per-request parameters
 // that BuildMessages requires (media, channel, chatID, sender, etc.).
 func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []string) int {
 	staticPrompt := cb.BuildSystemPromptWithCache()
@@ -515,20 +507,11 @@ func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []st
 		}
 	}
 
-	if summary != "" {
-		// Matches the CONTEXT_SUMMARY: prefix added in BuildMessages
-		const summaryPrefix = "CONTEXT_SUMMARY: The following is an approximate summary of prior conversation " +
-			"for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n"
-		totalChars += utf8.RuneCountInString(summaryPrefix) + utf8.RuneCountInString(summary)
-		totalChars += 7 // separator
-	}
-
-	// Workspace memory is appended by BuildMessagesFromPrompt as its own
-	// system block (no longer inside the static prompt) — count it here so
-	// the estimate keeps matching what actually gets sent.
-	if memoryContext := cb.memory.GetMemoryContext(); memoryContext != "" {
-		totalChars += utf8.RuneCountInString("# Memory\n\n") + utf8.RuneCountInString(memoryContext)
-		totalChars += 7 // separator
+	// Workspace memory and the summary travel in the per-turn context
+	// message rather than the system message, but they are sent on every
+	// call all the same — count them so the estimate matches the request.
+	if parts := cb.turnContextParts(summary); len(parts) > 0 {
+		totalChars += utf8.RuneCountInString(turnContextPromptMessage(parts).Content)
 	}
 
 	return totalChars * 2 / 5 // same heuristic as tokenizer.EstimateMessageTokens
@@ -795,7 +778,7 @@ func (cb *ContextBuilder) LoadBootstrapFiles() string {
 // buildDynamicContext returns a short dynamic context string with per-request info.
 // This changes every request (time, session) so it is NOT part of the cached prompt;
 // BuildMessagesFromPrompt delivers it at the tail of the conversation (inside the
-// current user turn) to keep the system prompt a stable, cacheable prefix.
+// turn context message) to keep the system prompt a stable, cacheable prefix.
 // LLM-side KV cache reuse is achieved by each provider adapter's native mechanism:
 //   - Anthropic: per-block cache_control (ephemeral) on the static SystemParts block
 //   - OpenAI / Codex: prompt_cache_key for prefix-based caching
@@ -861,13 +844,14 @@ func (cb *ContextBuilder) BuildMessages(
 func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []providers.Message {
 	messages := []providers.Message{}
 
-	// The default static part (identity, bootstrap, skills, memory) is cached
+	// The default static part (identity, bootstrap, skills) is cached
 	// locally to avoid repeated file I/O and string building on every call
 	// (fixes issue #607). Profile-customized static prompts are built on demand.
-	// The optional summary is appended per request unless the profile suppresses
-	// PicoClaw system context; the volatile runtime context (time, session,
-	// sender) is delivered in the current user turn instead so the system
-	// message stays a cache-stable prefix.
+	// Everything that changes between turns stays OUT of the system message
+	// so it is a byte-stable, cacheable prefix: workspace memory and the
+	// conversation summary go in the per-turn context message placed before
+	// the current turn, together with the runtime context (time, session,
+	// sender).
 	// Everything is sent as a single system message for provider compatibility:
 	// - Anthropic adapter extracts messages[0] (Role=="system") and maps its content
 	//   to the top-level "system" parameter in the Messages API request. A single
@@ -876,7 +860,7 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	// - OpenAI-compat passes messages through as-is.
 	staticPrompt, contentBlocks := cb.buildSystemPromptForRequest(req)
 
-	// Compose a single system message: static (cached) + overlays + optional summary.
+	// Compose a single system message: static (cached) + overlays.
 	// Keeping all system content in one message ensures every provider adapter can
 	// extract it correctly (Anthropic adapter -> top-level system param,
 	// Codex -> instructions field).
@@ -930,14 +914,15 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 
 	dynamicChars := 0
 	runtimeCtx := ""
+	turnCtxParts := []string(nil)
 	if !req.SuppressDefaultSystemPrompt {
 		// Build short dynamic context (time, runtime, session) — changes per
 		// request. It is NOT part of the system message: volatile content at the
 		// front of the prompt would invalidate provider-side prompt caches
 		// (Anthropic cache_control, OpenAI prefix caching) on every request.
 		// Instead it is delivered at the tail of the conversation, inside the
-		// current user turn (or as its own trailing user message on heartbeat
-		// turns with no user message) — see the end of this function.
+		// turn context message just before the current turn — see the end of
+		// this function.
 		runtimeCtx = cb.buildDynamicContext(
 			req.Channel,
 			req.ChatID,
@@ -946,36 +931,17 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 		)
 		dynamicChars = len(runtimeCtx)
 
-		if req.Summary != "" {
-			summaryPart := PromptPart{
-				ID:     "context.summary",
-				Layer:  PromptLayerContext,
-				Slot:   PromptSlotSummary,
-				Source: PromptSource{ID: PromptSourceSummary, Name: "context.summary"},
-				Title:  "context summary",
-				Content: fmt.Sprintf(
-					"CONTEXT_SUMMARY: The following is an approximate summary of prior conversation "+
-						"for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n%s",
-					req.Summary,
-				),
-				Stable: false,
-				Cache:  PromptCacheNone,
-			}
-			stringParts = append(stringParts, summaryPart.Content)
-			contentBlocks = append(contentBlocks, promptContentBlock(summaryPart, nil))
-		}
-
-		// Workspace memory goes LAST in the system prefix, with its own cache
-		// marker. It churns more than anything else in system — agents write
-		// their memory file nearly every turn — so everything stable must sit
-		// BEFORE it: an edit then invalidates only this block, and the marker
-		// keeps the rewrite to the memory span instead of the whole prefix
-		// (which is what happened when memory lived inside the static part).
-		if memoryContext := cb.memory.GetMemoryContext(); memoryContext != "" {
-			memoryPart := buildMemoryPromptPart(memoryContext)
-			stringParts = append(stringParts, memoryPart.Content)
-			contentBlocks = append(contentBlocks, promptContentBlock(memoryPart, nil))
-		}
+		// Workspace memory and the conversation summary are NOT part of the
+		// system message either. Both change between turns (agents edit
+		// MEMORY.md, the summarizer rewrites the summary), and any byte that
+		// changes inside the system prompt forfeits the provider prompt cache
+		// for everything after it: OpenAI's Responses API caches by prefix,
+		// so a changed `instructions` string re-bills instructions, tools AND
+		// the whole history on the next turn's first call. They travel in one
+		// turn context message placed just before the current turn instead
+		// (see turnContextPromptMessage), so the system prompt only changes
+		// when the persona does.
+		turnCtxParts = cb.turnContextParts(req.Summary)
 	}
 
 	if len(stringParts) == 0 && req.ToolUseFallback {
@@ -1019,7 +985,17 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 			"preview": preview,
 		})
 
-	history := sanitizeHistoryForProvider(req.History)
+	// Split off the active turn's own messages when the caller passes them
+	// through History (context-overflow retry rebuilds), so the turn context
+	// message lands before them exactly as it did on the turn's first call.
+	// The split sits on a user-message turn boundary, so sanitizing the two
+	// halves separately cannot orphan a tool-call/tool-result pair.
+	earlierHistory, activeTurnHistory := req.History, []providers.Message(nil)
+	if n := req.CurrentTurnHistory; n > 0 && n <= len(req.History) &&
+		req.History[len(req.History)-n].Role == "user" {
+		earlierHistory = req.History[:len(req.History)-n]
+		activeTurnHistory = req.History[len(req.History)-n:]
+	}
 
 	// Single system message containing all context — compatible with all providers.
 	// SystemParts enables cache-aware adapters to set per-block cache_control;
@@ -1032,32 +1008,34 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 		})
 	}
 
-	// Add conversation history
-	messages = append(messages, history...)
+	// Add conversation history from earlier turns.
+	messages = append(messages, sanitizeHistoryForProvider(earlierHistory)...)
 
-	// Add current user message. Media-only turns must still be preserved so
-	// multimodal providers receive the uploaded image even when the user sends
-	// no accompanying text.
-	//
-	// The per-request runtime context (time, session, sender) rides along as a
-	// clearly-delimited segment at the start of the current user turn. Placing
-	// it after the conversation history keeps the system prompt and history a
-	// stable, cacheable prefix. Heartbeat turns (no user message) deliver it as
-	// a trailing user message of its own. Note: only the raw user message is
-	// persisted to session history, so the runtime segment is rebuilt fresh
-	// each turn and never accumulates in history.
+	// The per-request runtime context (time, session, sender) is the last
+	// block of the turn context message. It used to be prepended to the
+	// current user message, but only the raw message is persisted, so the
+	// next turn re-sent that message with different bytes and the provider
+	// prefix cache diverged there. Now the user message is sent exactly as it
+	// is stored.
+	if runtimeCtx != "" {
+		turnCtxParts = append(turnCtxParts, wrapRuntimeContext(runtimeCtx))
+	}
+
+	// The turn context message (memory, summary, runtime context) sits
+	// immediately before the current turn. It is rebuilt every turn and never
+	// persisted, so it never accumulates in history; within a turn it is
+	// frozen in place and later iterations only append after it, so the whole
+	// prefix stays cacheable.
+	if len(turnCtxParts) > 0 {
+		messages = append(messages, turnContextPromptMessage(turnCtxParts))
+	}
+	messages = append(messages, sanitizeHistoryForProvider(activeTurnHistory)...)
+
+	// Add current user message, byte-identical to what SetupTurn persists.
+	// Media-only turns must still be preserved so multimodal providers receive
+	// the uploaded image even when the user sends no accompanying text.
 	if strings.TrimSpace(req.CurrentMessage) != "" || len(req.Media) > 0 {
-		content := req.CurrentMessage
-		if runtimeCtx != "" {
-			if strings.TrimSpace(content) != "" {
-				content = wrapRuntimeContext(runtimeCtx) + "\n\n" + content
-			} else {
-				content = wrapRuntimeContext(runtimeCtx)
-			}
-		}
-		messages = append(messages, userPromptMessage(content, req.Media))
-	} else if runtimeCtx != "" {
-		messages = append(messages, runtimeContextPromptMessage(runtimeCtx))
+		messages = append(messages, userPromptMessage(req.CurrentMessage, req.Media))
 	}
 	if len(messages) == 0 {
 		messages = append(messages, userPromptMessage("", nil))
@@ -1072,14 +1050,40 @@ func wrapRuntimeContext(runtimeCtx string) string {
 	return "[runtime context]\n" + runtimeCtx + "\n[/runtime context]"
 }
 
-// runtimeContextPromptMessage wraps the runtime context as a standalone
-// trailing user message for turns that carry no user message (heartbeats).
-func runtimeContextPromptMessage(runtimeCtx string) providers.Message {
+const (
+	turnContextOpen  = "[turn context]\nAdded by the runtime for the turn that follows; not written by the user."
+	turnContextClose = "[/turn context]"
+	contextSeparator = "\n\n---\n\n"
+	summaryPreamble  = "CONTEXT_SUMMARY: The following is an approximate summary of the conversation " +
+		"before the messages above, for reference only. It may be incomplete or outdated — " +
+		"always defer to explicit instructions."
+)
+
+// turnContextParts returns the per-turn context blocks that change between
+// turns — workspace memory, then the conversation summary — in the order
+// they are sent. Empty blocks are omitted.
+func (cb *ContextBuilder) turnContextParts(summary string) []string {
+	var parts []string
+	if cb.memory != nil {
+		if memoryContext := cb.memory.GetMemoryContext(); memoryContext != "" {
+			parts = append(parts, "# Memory\n\n"+memoryContext)
+		}
+	}
+	if summary != "" {
+		parts = append(parts, summaryPreamble+"\n\n"+summary)
+	}
+	return parts
+}
+
+// turnContextPromptMessage wraps the per-turn context blocks as one delimited
+// user-role message. It is placed just before the current turn, rebuilt on
+// every turn, and never written to session history.
+func turnContextPromptMessage(parts []string) providers.Message {
 	msg := providers.Message{
 		Role:    "user",
-		Content: wrapRuntimeContext(runtimeCtx),
+		Content: turnContextOpen + "\n\n" + strings.Join(parts, contextSeparator) + "\n" + turnContextClose,
 	}
-	return promptMessageWithMetadata(msg, PromptLayerContext, PromptSlotRuntime, PromptSourceRuntime)
+	return promptMessageWithMetadata(msg, PromptLayerContext, PromptSlotTurnContext, PromptSourceTurnContext)
 }
 
 func sanitizeHistoryForProvider(history []providers.Message) []providers.Message {
