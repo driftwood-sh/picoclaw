@@ -12,6 +12,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/routing"
 	"github.com/sipeed/picoclaw/pkg/session"
+	"github.com/sipeed/picoclaw/pkg/tools"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
@@ -206,7 +207,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		SenderID:                msg.SenderID,
 		SenderDisplayName:       msg.Sender.DisplayName,
 		DefaultResponse:         defaultResponse,
-		EnableSummary:           true,
+		EnableSummary:           !isOneShotSessionKey(sessionKey, msg.SessionKey),
 		SendResponse:            false,
 		AllowInterimPicoPublish: true,
 	}
@@ -330,4 +331,17 @@ func (al *AgentLoop) processSystemMessage(
 		EnableSummary:   false,
 		SendResponse:    true,
 	})
+}
+
+// isOneShotSessionKey reports whether any of the keys names a session that is
+// created for a single run and never read again (each cron run gets a fresh
+// agent:cron-<job>-<uuid> session). Summarizing those spends a model call on
+// history nobody will load.
+func isOneShotSessionKey(keys ...string) bool {
+	for _, key := range keys {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), tools.CronSessionKeyPrefix) {
+			return true
+		}
+	}
+	return false
 }

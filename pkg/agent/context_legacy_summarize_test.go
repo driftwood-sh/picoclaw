@@ -8,10 +8,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/tools"
 )
 
 type summarizerCall struct {
@@ -257,5 +259,45 @@ func TestSummarizerThinking_CapsAtLowWithoutEnablingThinking(t *testing.T) {
 		if got := summarizerThinking(tc.in); got != tc.want {
 			t.Errorf("summarizerThinking(%+v) = %+v, want %+v", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestCronSessionsAreNotSummarized: every cron run uses a fresh
+// agent:cron-<job>-<uuid> session that is never read again, so post-turn
+// summarization there is a wasted model call. A normal explicit session with
+// the same history is the control: it does get summarized.
+func TestCronSessionsAreNotSummarized(t *testing.T) {
+	for _, tc := range []struct {
+		key           string
+		wantSummarize bool
+	}{
+		{key: tools.CronSessionKeyPrefix + "job1-0b5e", wantSummarize: false},
+		{key: "agent:main:control-session", wantSummarize: true},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			provider := &summarizerRecordingProvider{}
+			al, agent := newSummarizerTestLoop(t, provider)
+			agent.Sessions.SetHistory(tc.key, sixMessageHistory())
+
+			_, err := al.ProcessDirectWithChannel(context.Background(), "run the job", tc.key, "pico", "chat-1")
+			if err != nil {
+				t.Fatalf("ProcessDirectWithChannel() error = %v", err)
+			}
+
+			deadline := time.Now().Add(2 * time.Second)
+			for agent.Sessions.GetSummary(tc.key) == "" && time.Now().Before(deadline) {
+				if !tc.wantSummarize {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !tc.wantSummarize {
+				time.Sleep(200 * time.Millisecond) // give a (wrongly) started summarizer time to land
+			}
+			summarized := agent.Sessions.GetSummary(tc.key) != ""
+			if summarized != tc.wantSummarize {
+				t.Fatalf("session %q summarized = %v, want %v", tc.key, summarized, tc.wantSummarize)
+			}
+		})
 	}
 }
