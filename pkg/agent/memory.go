@@ -146,28 +146,48 @@ func (ms *MemoryStore) budget() int {
 	return config.DefaultMemoryMaxBytes
 }
 
-// capMemoryBlock keeps the first maxBytes of content (cut at a line break when
-// one falls in the second half of the budget, never inside a UTF-8 sequence)
-// and appends a notice telling the agent the block is over budget. Memory is
-// injected into every request, and an uncapped MEMORY.md once grew to 918 KB
-// and pushed the request past OpenAI's 1 MB instructions limit, failing every
-// turn until the file was trimmed by hand.
-func capMemoryBlock(content string, maxBytes int, what, curateHint string) (string, bool) {
+// capMemoryBlock keeps at most maxBytes of an over-budget block: the head
+// (first third of the budget) and the tail (last two thirds), each cut on a
+// line boundary and never inside a UTF-8 sequence, with a gap marker between
+// them and a notice at the end. The head holds the file's oldest curated core
+// and structure; the tail holds the newest facts, which agents append at the
+// end — keeping only the head would hide every new fact and the agent would
+// keep re-adding them. Memory is injected into every request, and an uncapped
+// MEMORY.md once grew to 918 KB and pushed the request past OpenAI's 1 MB
+// instructions limit, failing every turn until the file was trimmed by hand.
+func capMemoryBlock(content string, maxBytes int, what, shrinkHint string) (string, bool) {
 	if len(content) <= maxBytes {
 		return content, false
 	}
-	cut := maxBytes
-	for cut > 0 && !utf8.RuneStart(content[cut]) {
-		cut--
+	headBudget := maxBytes / 3
+	tailBudget := maxBytes - headBudget
+
+	headEnd := headBudget
+	for headEnd > 0 && !utf8.RuneStart(content[headEnd]) {
+		headEnd--
 	}
-	if nl := strings.LastIndexByte(content[:cut], '\n'); nl >= maxBytes/2 {
-		cut = nl
+	if nl := strings.LastIndexByte(content[:headEnd], '\n'); nl >= headBudget/2 {
+		headEnd = nl + 1
 	}
+
+	tailStart := len(content) - tailBudget
+	for tailStart < len(content) && !utf8.RuneStart(content[tailStart]) {
+		tailStart++
+	}
+	if tailStart > 0 && content[tailStart-1] != '\n' {
+		if nl := strings.IndexByte(content[tailStart:], '\n'); nl >= 0 && nl < tailBudget/2 {
+			tailStart += nl + 1
+		}
+	}
+
+	head := strings.TrimRight(content[:headEnd], "\n")
+	tail := strings.TrimRight(content[tailStart:], "\n")
+	gap := fmt.Sprintf("[... %s omitted from the middle ...]", formatKB(tailStart-headEnd))
 	notice := fmt.Sprintf(
-		"[%s is %s, over the %s budget; only the first %s is shown above. %s]",
-		what, formatKB(len(content)), formatKB(maxBytes), formatKB(cut), curateHint,
+		"[%s is %s, over the %s budget; only its start and end are shown. %s]",
+		what, formatKB(len(content)), formatKB(maxBytes), shrinkHint,
 	)
-	return strings.TrimRight(content[:cut], "\n") + "\n\n" + notice, true
+	return head + "\n\n" + gap + "\n\n" + tail + "\n\n" + notice, true
 }
 
 func formatKB(n int) string {
@@ -189,10 +209,11 @@ func (ms *MemoryStore) GetMemoryContext() string {
 	var cappedLong, cappedNotes bool
 	longTermSize, notesSize := len(longTerm), len(recentNotes)
 	longTerm, cappedLong = capMemoryBlock(longTerm, maxBytes, "Your MEMORY.md ("+ms.memoryFile+")",
-		"Curate it now: read the full file, then merge related lines, shorten entries, "+
-			"and delete stale ones until it fits.")
+		"Shrink it below "+formatKB(maxBytes)+" now with edit_file or exec (delete stale and "+
+			"duplicate lines, merge related ones); don't read the whole file.")
 	recentNotes, cappedNotes = capMemoryBlock(recentNotes, maxBytes, "Your recent daily notes",
-		"Move what still matters into MEMORY.md and shorten or delete the rest.")
+		"Shrink them below "+formatKB(maxBytes)+" now with edit_file or exec (move what still "+
+			"matters into MEMORY.md, delete the rest); don't read the whole files.")
 	if cappedLong || cappedNotes {
 		logger.WarnCF("agent", "Workspace memory over budget; injecting a truncated copy", map[string]any{
 			"workspace":        ms.workspace,

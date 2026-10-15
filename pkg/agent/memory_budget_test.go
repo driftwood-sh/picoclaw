@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,18 +38,19 @@ func TestMemoryContext_UnderBudgetIsInjectedWhole(t *testing.T) {
 	}
 }
 
-// TestMemoryContext_OverBudgetIsCappedWithCurateNotice: autosana's MEMORY.md
-// reached 918 KB and broke OpenAI's 1 MB instructions limit for five days.
-// Over budget, only the first N bytes are injected, plus a notice telling the
-// agent the real size, the budget, and to curate the file now.
-func TestMemoryContext_OverBudgetIsCappedWithCurateNotice(t *testing.T) {
+// TestMemoryContext_OverBudgetKeepsHeadAndTail: autosana's MEMORY.md reached
+// 918 KB and broke OpenAI's 1 MB instructions limit for five days. Over
+// budget, the agent sees the file's start and its end (agents append new
+// facts at the end, so a head-only cut would hide every new fact), a gap
+// marker, and a bounded instruction to shrink the file without reading it.
+func TestMemoryContext_OverBudgetKeepsHeadAndTail(t *testing.T) {
 	ws := t.TempDir()
 	var sb strings.Builder
+	sb.WriteString("# Core facts\n")
 	for i := 0; sb.Len() < 900*1024; i++ {
-		sb.WriteString("- 2026-10-14: fact number ")
-		sb.WriteString(strings.Repeat("x", i%40))
-		sb.WriteString("\n")
+		fmt.Fprintf(&sb, "- 2026-10-14: fact number %d %s\n", i, strings.Repeat("x", i%40))
 	}
+	sb.WriteString("- 2026-10-15: NEWEST FACT\n")
 	writeMemoryFile(t, ws, sb.String())
 
 	ms := NewMemoryStore(ws)
@@ -58,19 +60,34 @@ func TestMemoryContext_OverBudgetIsCappedWithCurateNotice(t *testing.T) {
 	if len(got) > 33*1024 {
 		t.Fatalf("memory context = %d bytes, want about the 32 KB budget", len(got))
 	}
+	if !strings.HasPrefix(got, "## Long-term Memory\n\n# Core facts\n- 2026-10-14: fact number 0 ") {
+		t.Fatalf("capped memory must keep the head of the file:\n%s", got[:200])
+	}
+	if !strings.Contains(got, "- 2026-10-15: NEWEST FACT\n\n[Your MEMORY.md") {
+		t.Fatalf("capped memory must keep the newest (last) lines:\n%s", got[len(got)-600:])
+	}
+	if !strings.Contains(got, "KB omitted from the middle ...]") {
+		t.Fatal("capped memory missing the gap marker")
+	}
 	wantSize := "is " + formatKB(sb.Len())
-	for _, want := range []string{"MEMORY.md", wantSize, "over the 32 KB budget", "Curate it now"} {
+	for _, want := range []string{
+		"MEMORY.md", wantSize, "over the 32 KB budget", "Shrink it below 32 KB now",
+		"edit_file or exec", "don't read the whole file",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("notice missing %q:\n%s", want, got[len(got)-400:])
 		}
 	}
-	if !strings.HasPrefix(got, "## Long-term Memory\n\n- 2026-10-14: fact number") {
-		t.Fatalf("capped memory must keep the head of the file:\n%s", got[:200])
+	if strings.Contains(got, "read the full file") {
+		t.Error("notice must not ask the agent to read the whole file")
 	}
-	// Cut on a line boundary: the kept text ends with a complete line.
-	kept := got[:strings.Index(got, "\n\n[Your MEMORY.md")]
-	if last := kept[strings.LastIndexByte(kept, '\n')+1:]; !strings.HasPrefix(last, "- 2026-10-14: fact number") {
-		t.Fatalf("kept text ends mid-line: %q", last)
+	// Both cuts land on line boundaries: every kept line is a whole line.
+	for _, line := range strings.Split(got, "\n") {
+		if line == "" || strings.HasPrefix(line, "- 2026-10-1") || strings.HasPrefix(line, "#") ||
+			strings.HasPrefix(line, "[") {
+			continue
+		}
+		t.Fatalf("kept text contains a partial line: %q", line)
 	}
 }
 

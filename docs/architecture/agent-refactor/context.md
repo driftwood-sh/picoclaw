@@ -36,7 +36,7 @@ current user message is sent exactly as it is stored and re-serializes
 byte-identically on later turns.
 MEMORY.md and the recent daily notes are each capped at
 `agents.defaults.memory_max_bytes` (default 32 KB); over budget, the agent
-sees the head of the file plus a notice to curate it.
+sees the start and the end of the file plus a notice to shrink it.
 
 `MaxTokens` (the output generation limit) must also be reserved from the total budget.
 
