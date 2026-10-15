@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sipeed/picoclaw/pkg/config"
 	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
@@ -171,8 +172,13 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
 	}, true
 }
 
+// summarizeTimeout bounds one background summarization (up to three model
+// calls with retries). Reasoning models at high effort routinely need more
+// than the old 120s for a long transcript; model request timeouts run 600s.
+const summarizeTimeout = 10 * time.Minute
+
 func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), summarizeTimeout)
 	defer cancel()
 
 	history := agent.Sessions.GetHistory(sessionKey)
@@ -222,7 +228,10 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
 		part1 := validMessages[:mid]
 		part2 := validMessages[mid:]
 
-		s1, _ := m.summarizeBatch(ctx, agent, part1, "")
+		// The existing summary covers everything before part1. It must ride
+		// with the first half, or the merged result (which replaces it)
+		// silently drops all earlier context.
+		s1, _ := m.summarizeBatch(ctx, agent, part1, summary)
 		s2, _ := m.summarizeBatch(ctx, agent, part2, "")
 
 		mergePrompt := fmt.Sprintf(
@@ -234,6 +243,10 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
 		if err == nil && resp.Content != "" {
 			finalSummary = resp.Content
 		} else {
+			logger.WarnCF("agent", "Summary merge failed; concatenating the two halves", map[string]any{
+				"agent_id":    agent.ID,
+				"session_key": sessionKey,
+			})
 			finalSummary = s1 + " " + s2
 		}
 	} else {
@@ -245,6 +258,19 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
 	}
 
 	if finalSummary != "" {
+		// The model calls above take a while, and the next turn may already
+		// have appended messages (or compacted the session). Truncate against
+		// the history as it is now: drop exactly the summarized prefix, and
+		// only if it is still the prefix.
+		current := agent.Sessions.GetHistory(sessionKey)
+		if len(current) < safeCut || !messageSlicesEquivalent(current[:safeCut], history[:safeCut]) {
+			logger.WarnCF("agent", "Session changed during summarization; discarding the summary", map[string]any{
+				"agent_id":    agent.ID,
+				"session_key": sessionKey,
+			})
+			return
+		}
+		keepCount = len(current) - safeCut
 		agent.Sessions.SetSummary(sessionKey, finalSummary)
 		agent.Sessions.TruncateHistory(sessionKey, keepCount)
 		agent.Sessions.Save(sessionKey)
@@ -290,8 +316,6 @@ func (m *legacyContextManager) retryLLMCall(
 	prompt string,
 	maxRetries int,
 ) (*providers.LLMResponse, error) {
-	const llmTemperature = 0.3
-
 	var resp *providers.LLMResponse
 	var err error
 
@@ -299,28 +323,95 @@ func (m *legacyContextManager) retryLLMCall(
 		m.al.activeRequestsInc()
 		resp, err = func() (*providers.LLMResponse, error) {
 			defer m.al.activeRequestsDec()
-			return agent.Provider.Chat(
-				ctx,
-				[]providers.Message{{Role: "user", Content: prompt}},
-				nil,
-				agent.Model,
-				map[string]any{
-					"max_tokens":       agent.MaxTokens,
-					"temperature":      llmTemperature,
-					"prompt_cache_key": agent.ID,
-				},
-			)
+			return m.summarizerChat(ctx, agent, prompt)
 		}()
 
 		if err == nil && resp != nil && resp.Content != "" {
 			return resp, nil
 		}
+		fields := map[string]any{
+			"agent_id": agent.ID,
+			"attempt":  attempt + 1,
+			"of":       maxRetries,
+		}
+		if err != nil {
+			fields["error"] = err.Error()
+		} else {
+			fields["error"] = "empty response"
+		}
+		logger.WarnCF("agent", "Summarization LLM call failed", fields)
 		if attempt < maxRetries-1 {
 			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 		}
 	}
 
+	if err == nil {
+		err = fmt.Errorf("summarization returned an empty response")
+	}
 	return resp, err
+}
+
+// summarizerChat sends one summarization prompt the way the main turn calls
+// its model: the agent's resolved candidates (API model id, not the config
+// alias), the candidate's provider and its configured thinking level, through
+// the fallback chain when there is more than one candidate. It sends no
+// temperature: reasoning models reject any non-default value, and the old
+// hard-coded 0.3 made every summarization request fail on gpt-6.1-sol.
+func (m *legacyContextManager) summarizerChat(
+	ctx context.Context,
+	agent *AgentInstance,
+	prompt string,
+) (*providers.LLMResponse, error) {
+	messages := []providers.Message{{Role: "user", Content: prompt}}
+	baseOpts := map[string]any{
+		"max_tokens":       agent.MaxTokens,
+		"prompt_cache_key": agent.ID + ":summary",
+	}
+
+	candidates, _ := refusalHoldSelection(
+		agent,
+		agent.Candidates,
+		resolvedCandidateModel(agent.Candidates, agent.Model),
+	)
+	if len(candidates) == 0 {
+		// No resolved candidates (legacy single-provider setups): the agent's
+		// provider and model are all there is.
+		return agent.Provider.Chat(ctx, messages, nil, agent.Model, baseOpts)
+	}
+
+	var cfg *config.Config
+	if m.al != nil {
+		cfg = m.al.GetConfig()
+	}
+	run := func(ctx context.Context, candidate providers.FallbackCandidate) (*providers.LLMResponse, error) {
+		provider, err := providerForFallbackCandidate(
+			agent, agent.Provider, candidates, candidate.Provider, candidate.Model,
+		)
+		if err != nil {
+			return nil, err
+		}
+		opts := shallowCloneLLMOptions(baseOpts)
+		if cfg != nil {
+			modelCfg := resolveActiveModelConfig(
+				cfg,
+				agent.Workspace,
+				[]providers.FallbackCandidate{candidate},
+				candidate.Model,
+				cfg.Agents.Defaults.Provider,
+			)
+			applyThinkingOption(opts, provider, activeThinkingSettings(agent, modelCfg), false, agent.ID)
+		}
+		return provider.Chat(ctx, messages, nil, candidate.Model, opts)
+	}
+
+	if len(candidates) > 1 && m.al != nil && m.al.fallback != nil {
+		result, err := m.al.fallback.ExecuteCandidate(ctx, candidates, run)
+		if err != nil {
+			return nil, err
+		}
+		return result.Response, nil
+	}
+	return run(ctx, candidates[0])
 }
 
 func (m *legacyContextManager) summarizeBatch(
@@ -352,6 +443,15 @@ func (m *legacyContextManager) summarizeBatch(
 	if err == nil && response.Content != "" {
 		return strings.TrimSpace(response.Content), nil
 	}
+	errText := "empty response"
+	if err != nil {
+		errText = err.Error()
+	}
+	logger.WarnCF("agent", "Summarization failed; using truncated-transcript fallback summary", map[string]any{
+		"agent_id": agent.ID,
+		"messages": len(batch),
+		"error":    errText,
+	})
 
 	var fallback strings.Builder
 	fallback.WriteString("Conversation summary: ")
