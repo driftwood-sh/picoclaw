@@ -501,8 +501,17 @@ func convertMessages(messages []Message) ([]types.Message, []types.SystemContent
 			})
 
 		case msg.Role == "user":
-			// Regular user message (no ToolCallID)
+			// Regular user message (no ToolCallID). Converse requires roles to
+			// alternate, and the agent can send consecutive user messages (the
+			// per-turn context message precedes the current user message;
+			// steering follows tool results), so fold this one into a
+			// preceding user message instead of starting a new one.
 			content := buildUserContent(msg)
+			if n := len(bedrockMessages); n > 0 && bedrockMessages[n-1].Role == types.ConversationRoleUser {
+				bedrockMessages[n-1].Content = append(bedrockMessages[n-1].Content, content...)
+				i++
+				continue
+			}
 			bedrockMessages = append(bedrockMessages, types.Message{
 				Role:    types.ConversationRoleUser,
 				Content: content,

@@ -34,6 +34,7 @@ const (
 	PromptSlotMemory       PromptSlot = "memory"
 	PromptSlotRuntime      PromptSlot = "runtime"
 	PromptSlotSummary      PromptSlot = "summary"
+	PromptSlotTurnContext  PromptSlot = "turn_context"
 	PromptSlotMessage      PromptSlot = "message"
 	PromptSlotSteering     PromptSlot = "steering"
 	PromptSlotSubTurn      PromptSlot = "subturn"
@@ -50,6 +51,7 @@ const (
 	PromptSourceWorkspace      PromptSourceID = "workspace.definition"
 	PromptSourceRuntime        PromptSourceID = "runtime.context"
 	PromptSourceSummary        PromptSourceID = "context.summary"
+	PromptSourceTurnContext    PromptSourceID = "runtime.turn_context"
 	PromptSourceMemory         PromptSourceID = "memory:workspace"
 	PromptSourceSkillCatalog   PromptSourceID = "skill:index"
 	PromptSourceActiveSkills   PromptSourceID = "skill:active"
@@ -117,6 +119,14 @@ type PromptBuildRequest struct {
 
 	ActiveSkills []string
 	Overlays     []PromptPart
+
+	// CurrentTurnHistory is the number of trailing History messages that
+	// belong to the turn being built. Rebuilds that carry the active turn's
+	// persisted messages in History (context-overflow retry, where
+	// CurrentMessage is empty) set it so the per-turn context message is
+	// inserted before those messages, at the same position it held on the
+	// turn's first call. Zero means History holds only earlier turns.
+	CurrentTurnHistory int
 
 	SuppressDefaultSystemPrompt bool
 	SuppressSkillContext        bool
@@ -231,6 +241,13 @@ func builtinPromptSources() []PromptSourceDescriptor {
 			Owner:           "context_manager",
 			Description:     "Conversation summary context",
 			Allowed:         []PromptPlacement{{Layer: PromptLayerContext, Slot: PromptSlotSummary}},
+			StableByDefault: false,
+		},
+		{
+			ID:              PromptSourceTurnContext,
+			Owner:           "agent",
+			Description:     "Per-turn context message (memory, summary, runtime) placed before the current turn",
+			Allowed:         []PromptPlacement{{Layer: PromptLayerContext, Slot: PromptSlotTurnContext}},
 			StableByDefault: false,
 		},
 		{
@@ -499,6 +516,8 @@ func slotPriority(slot PromptSlot) int {
 		return 690
 	case PromptSlotSummary:
 		return 680
+	case PromptSlotTurnContext:
+		return 675
 	case PromptSlotMessage:
 		return 600
 	case PromptSlotSteering:

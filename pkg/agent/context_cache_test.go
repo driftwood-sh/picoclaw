@@ -49,6 +49,17 @@ func assertUserTurnWithRuntimeContext(t *testing.T, msg providers.Message, wantT
 	}
 }
 
+// turnContextMessage returns the per-turn context message (memory, summary)
+// that BuildMessages places immediately before the current turn.
+func turnContextMessage(msgs []providers.Message) (providers.Message, bool) {
+	for _, m := range msgs {
+		if m.PromptSource == string(PromptSourceTurnContext) {
+			return m, true
+		}
+	}
+	return providers.Message{}, false
+}
+
 // TestSingleSystemMessage verifies that BuildMessages always produces exactly one
 // system message regardless of summary/history variations.
 // Fix: multiple system messages break Anthropic (top-level system param) and
@@ -141,18 +152,27 @@ func TestSingleSystemMessage(t *testing.T) {
 				t.Error("current user turn missing original user message text")
 			}
 
-			// Summary handling
+			// Summary handling: the summary changes between turns, so it
+			// travels in the turn context message, never the system message.
+			if strings.Contains(sys, "CONTEXT_SUMMARY:") {
+				t.Error("system message must not contain the summary (cache prefix stability)")
+			}
+			turnCtx, hasTurnCtx := turnContextMessage(msgs)
 			if tt.summary != "" {
-				if !strings.Contains(sys, "CONTEXT_SUMMARY:") {
+				if !hasTurnCtx {
+					t.Fatal("summary present but no turn context message")
+				}
+				if !strings.Contains(turnCtx.Content, "CONTEXT_SUMMARY:") {
 					t.Error("summary present but CONTEXT_SUMMARY prefix missing")
 				}
-				if !strings.Contains(sys, tt.summary[:20]) {
-					t.Error("summary content not found in system message")
+				if !strings.Contains(turnCtx.Content, tt.summary[:20]) {
+					t.Error("summary content not found in turn context message")
 				}
-			} else {
-				if strings.Contains(sys, "CONTEXT_SUMMARY:") {
-					t.Error("CONTEXT_SUMMARY should not appear without summary")
+				if msgs[len(msgs)-2].PromptSource != string(PromptSourceTurnContext) {
+					t.Error("turn context message must sit immediately before the current user turn")
 				}
+			} else if hasTurnCtx {
+				t.Errorf("unexpected turn context message without summary or memory: %q", turnCtx.Content)
 			}
 		})
 	}
@@ -285,12 +305,12 @@ func TestMtimeAutoInvalidation(t *testing.T) {
 		})
 	}
 
-	// Memory deliberately lives OUTSIDE the cached static prompt: agents edit
-	// their memory file nearly every turn, and memory bytes at the front of
-	// the prompt invalidated the provider-side prefix cache on every edit.
-	// It is delivered live via BuildMessagesFromPrompt as the final system
-	// block instead — so a change must show up there, and must NOT show up
-	// in (or invalidate expectations about) the static prompt.
+	// Memory deliberately lives OUTSIDE the system prompt: agents edit their
+	// memory file nearly every turn, and memory bytes inside the system prompt
+	// invalidated the provider-side prefix cache on every edit. It is
+	// delivered live via BuildMessagesFromPrompt in the turn context message
+	// instead — so a change must show up there, and must NOT show up in the
+	// static prompt or the system message.
 	t.Run("memory file change flows through messages, not the static prompt", func(t *testing.T) {
 		tmpDir := setupWorkspace(t, map[string]string{
 			"memory/MEMORY.md": "# Memory\nUser likes Go.",
@@ -302,9 +322,9 @@ func TestMtimeAutoInvalidation(t *testing.T) {
 		if sp := cb.BuildSystemPromptWithCache(); strings.Contains(sp, "User likes Go") {
 			t.Fatal("static prompt must not embed memory content")
 		}
-		sys1 := buildSystemMessageContent(t, cb)
-		if !strings.Contains(sys1, "User likes Go") {
-			t.Fatalf("system message missing memory content:\n%s", sys1)
+		ctx1 := buildTurnContextContent(t, cb)
+		if !strings.Contains(ctx1, "User likes Go") {
+			t.Fatalf("turn context message missing memory content:\n%s", ctx1)
 		}
 
 		fullPath := filepath.Join(tmpDir, "memory/MEMORY.md")
@@ -312,9 +332,9 @@ func TestMtimeAutoInvalidation(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		sys2 := buildSystemMessageContent(t, cb)
-		if !strings.Contains(sys2, "User likes Rust") {
-			t.Fatalf("system message missing updated memory content:\n%s", sys2)
+		ctx2 := buildTurnContextContent(t, cb)
+		if !strings.Contains(ctx2, "User likes Rust") {
+			t.Fatalf("turn context message missing updated memory content:\n%s", ctx2)
 		}
 	})
 
@@ -456,8 +476,8 @@ func TestNewFileCreationInvalidatesCache(t *testing.T) {
 
 		cb := NewContextBuilder(tmpDir)
 
-		if sys := buildSystemMessageContent(t, cb); strings.Contains(sys, "User prefers dark mode") {
-			t.Fatal("system message should not contain memory before the file exists")
+		if ctx := buildTurnContextContent(t, cb); strings.Contains(ctx, "User prefers dark mode") {
+			t.Fatal("turn context should not contain memory before the file exists")
 		}
 
 		fullPath := filepath.Join(tmpDir, "memory", "MEMORY.md")
@@ -466,23 +486,31 @@ func TestNewFileCreationInvalidatesCache(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if sys := buildSystemMessageContent(t, cb); !strings.Contains(sys, "User prefers dark mode") {
-			t.Fatalf("system message missing new memory content:\n%s", sys)
+		if ctx := buildTurnContextContent(t, cb); !strings.Contains(ctx, "User prefers dark mode") {
+			t.Fatalf("turn context message missing new memory content:\n%s", ctx)
 		}
 	})
 }
 
-// buildSystemMessageContent renders a request through BuildMessagesFromPrompt
-// and returns the system message's concatenated content — the surface where
-// workspace memory is delivered (it is intentionally not part of the cached
-// static prompt).
-func buildSystemMessageContent(t *testing.T, cb *ContextBuilder) string {
+// buildTurnContextContent renders a request through BuildMessagesFromPrompt
+// and returns the turn context message's content — the surface where
+// workspace memory is delivered (it is intentionally not part of the system
+// prompt). Returns "" when there is no turn context message. It also asserts
+// that no memory leaked into the system message.
+func buildTurnContextContent(t *testing.T, cb *ContextBuilder) string {
 	t.Helper()
 	messages := cb.BuildMessagesFromPrompt(PromptBuildRequest{CurrentMessage: "hi"})
 	if len(messages) == 0 || messages[0].Role != "system" {
 		t.Fatalf("expected leading system message, got %d messages", len(messages))
 	}
-	return messages[0].Content
+	if strings.Contains(messages[0].Content, "# Memory") {
+		t.Fatalf("system message must not carry workspace memory:\n%s", messages[0].Content)
+	}
+	turnCtx, ok := turnContextMessage(messages)
+	if !ok {
+		return ""
+	}
+	return turnCtx.Content
 }
 
 // TestSkillFileContentChange verifies that modifying a skill file's content

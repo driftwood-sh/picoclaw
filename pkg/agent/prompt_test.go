@@ -116,13 +116,13 @@ func TestBuildMessagesFromPrompt_AttachesInternalPromptMetadata(t *testing.T) {
 		CurrentMessage: "hello",
 		Summary:        "prior context",
 	})
-	if len(messages) != 2 {
-		t.Fatalf("messages len = %d, want 2", len(messages))
+	if len(messages) != 3 {
+		t.Fatalf("messages len = %d, want 3 (system + turn context + user)", len(messages))
 	}
 
 	system := messages[0]
-	if len(system.SystemParts) < 2 {
-		t.Fatalf("system parts len = %d, want at least 2", len(system.SystemParts))
+	if len(system.SystemParts) < 1 {
+		t.Fatalf("system parts len = %d, want at least 1", len(system.SystemParts))
 	}
 	if system.SystemParts[0].PromptLayer != string(PromptLayerKernel) ||
 		system.SystemParts[0].PromptSlot != string(PromptSlotIdentity) ||
@@ -130,25 +130,29 @@ func TestBuildMessagesFromPrompt_AttachesInternalPromptMetadata(t *testing.T) {
 		t.Fatalf("static system metadata = %#v, want kernel identity", system.SystemParts[0])
 	}
 
-	var hasSummary bool
 	for _, part := range system.SystemParts {
 		switch part.PromptSource {
-		case string(PromptSourceRuntime):
-			// The volatile runtime context must not sit in the system message:
-			// it would invalidate the provider-side prompt cache every request.
-			t.Fatalf("runtime context part = %#v, must not be in system message", part)
-		case string(PromptSourceSummary):
-			hasSummary = true
-			if part.CacheControl != nil {
-				t.Fatalf("summary cache control = %#v, want nil", part.CacheControl)
-			}
+		case string(PromptSourceRuntime), string(PromptSourceSummary), string(PromptSourceMemory):
+			// Per-turn context must not sit in the system message: any change
+			// there invalidates the provider-side prompt cache for the whole
+			// request.
+			t.Fatalf("per-turn part = %#v, must not be in system message", part)
 		}
 	}
-	if !hasSummary {
-		t.Fatal("system parts missing summary prompt metadata")
+
+	turnCtx := messages[1]
+	if turnCtx.Role != "user" ||
+		turnCtx.PromptLayer != string(PromptLayerContext) ||
+		turnCtx.PromptSlot != string(PromptSlotTurnContext) ||
+		turnCtx.PromptSource != string(PromptSourceTurnContext) {
+		t.Fatalf("turn context metadata = %#v, want context turn_context", turnCtx)
+	}
+	if !strings.Contains(turnCtx.Content, "CONTEXT_SUMMARY:") ||
+		!strings.Contains(turnCtx.Content, "prior context") {
+		t.Fatalf("turn context missing summary: %q", turnCtx.Content)
 	}
 
-	user := messages[1]
+	user := messages[2]
 	if user.PromptLayer != string(PromptLayerTurn) ||
 		user.PromptSlot != string(PromptSlotMessage) ||
 		user.PromptSource != string(PromptSourceUserMessage) {

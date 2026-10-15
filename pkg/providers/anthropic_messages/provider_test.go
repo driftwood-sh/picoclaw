@@ -373,6 +373,45 @@ func cachedSystemMessage() Message {
 	}
 }
 
+// TestBuildRequestBody_TurnContextLayoutBreakpoints pins the marker budget for
+// the agent's request layout: workspace memory no longer rides as a second
+// marked system block, so the system keeps one marker and the newest user
+// message (just after the per-turn context message) carries a marker, which
+// caches the turn context together with the rest of the prefix.
+func TestBuildRequestBody_TurnContextLayoutBreakpoints(t *testing.T) {
+	messages := []Message{
+		cachedSystemMessage(),
+		{Role: "user", Content: "earlier question"},
+		{Role: "assistant", Content: "earlier answer"},
+		{Role: "user", Content: "[turn context]\n# Memory\n- fact\n[/turn context]"},
+		{Role: "user", Content: "current question"},
+	}
+
+	got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+	if err != nil {
+		t.Fatalf("buildRequestBody() error: %v", err)
+	}
+
+	systemMarkers := 0
+	for _, b := range got["system"].([]any) {
+		if _, ok := b.(map[string]any)["cache_control"]; ok {
+			systemMarkers++
+		}
+	}
+	if systemMarkers != 1 {
+		t.Fatalf("system markers = %d, want 1", systemMarkers)
+	}
+
+	apiMessages := got["messages"].([]any)
+	total, marked := countMessageCacheMarkers(t, apiMessages)
+	if want := []int{len(apiMessages) - 1}; !reflect.DeepEqual(marked, want) {
+		t.Fatalf("marked message indexes = %v, want %v (newest user message)", marked, want)
+	}
+	if systemMarkers+total > maxCacheBreakpoints {
+		t.Fatalf("total markers = %d, over the %d limit", systemMarkers+total, maxCacheBreakpoints)
+	}
+}
+
 // TestBuildRequestBody_MessageCacheBreakpoints verifies stride-spaced
 // cache_control breakpoints on user messages: the newest user message always
 // carries a marker, earlier markers appear only after breakpointStrideBlocks

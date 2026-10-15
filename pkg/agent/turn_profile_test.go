@@ -125,14 +125,17 @@ func TestTurnProfile_DisabledPreservesDefaultHistoryAndPrompt(t *testing.T) {
 	if got != "profile response" {
 		t.Fatalf("runAgentLoop() = %q, want profile response", got)
 	}
-	if len(provider.messages) != 4 {
-		t.Fatalf("provider messages len = %d, want system + history + user", len(provider.messages))
+	if len(provider.messages) != 5 {
+		t.Fatalf("provider messages len = %d, want system + history + turn context + user", len(provider.messages))
 	}
 	if !reflect.DeepEqual(provider.messages[1:3], initialHistory) {
 		t.Fatalf("provider history = %#v, want %#v", provider.messages[1:3], initialHistory)
 	}
-	if !strings.Contains(provider.messages[0].Content, "CONTEXT_SUMMARY") {
-		t.Fatalf("system prompt missing summary in default mode:\n%s", provider.messages[0].Content)
+	if !strings.Contains(provider.messages[3].Content, "CONTEXT_SUMMARY") {
+		t.Fatalf("turn context missing summary in default mode:\n%s", provider.messages[3].Content)
+	}
+	if strings.Contains(provider.messages[0].Content, "CONTEXT_SUMMARY") {
+		t.Fatalf("system prompt must not carry the summary:\n%s", provider.messages[0].Content)
 	}
 	history := agent.Sessions.GetHistory(sessionKey)
 	if len(history) != len(initialHistory)+2 {
