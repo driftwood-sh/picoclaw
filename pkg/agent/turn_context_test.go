@@ -1,12 +1,16 @@
 package agent
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
 
@@ -82,18 +86,25 @@ func TestBuildMessages_SystemPromptStableAcrossTurnContextChanges(t *testing.T) 
 	}
 }
 
-// TestBuildMessages_NoTurnContextWithoutMemoryOrSummary keeps workers with no
-// memory file and no summary on their old two-message layout.
-func TestBuildMessages_NoTurnContextWithoutMemoryOrSummary(t *testing.T) {
+// TestBuildMessages_UserMessageSentAsStored pins fix 2 of the context audit:
+// the current user message goes out byte-identical to what SetupTurn persists
+// (userPromptMessage of the raw text), so the next turn re-sends it unchanged.
+// The runtime context rides in the unpersisted turn context message.
+func TestBuildMessages_UserMessageSentAsStored(t *testing.T) {
 	t.Setenv("PICOCLAW_BUILTIN_SKILLS", t.TempDir())
 	cb := NewContextBuilder(t.TempDir())
 
-	msgs := cb.BuildMessages(nil, "", "task", nil, "pico", "chat-1", "", "")
-	if len(msgs) != 2 {
-		t.Fatalf("messages len = %d, want 2 (system + user)", len(msgs))
+	msgs := cb.BuildMessages(nil, "", "task", nil, "pico", "chat-1", "pico-remote", "")
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want 3 (system + turn context + user)", len(msgs))
 	}
-	if _, ok := turnContextMessage(msgs); ok {
-		t.Fatal("unexpected turn context message with no memory and no summary")
+	stored := userPromptMessage("task", nil)
+	if !reflect.DeepEqual(msgs[2], stored) {
+		t.Fatalf("sent user message = %#v, want the persisted form %#v", msgs[2], stored)
+	}
+	turnCtx := assertUserTurnWithRuntimeContext(t, msgs, "task")
+	if strings.Contains(turnCtx.Content, "# Memory") || strings.Contains(turnCtx.Content, "CONTEXT_SUMMARY") {
+		t.Fatalf("turn context has memory/summary with none configured: %q", turnCtx.Content)
 	}
 }
 
@@ -146,4 +157,86 @@ func TestBuildMessages_TurnContextPrecedesActiveTurnOnRetryRebuild(t *testing.T)
 	if !reflect.DeepEqual(msgs[turnCtxIdx+1:], activeTurn) {
 		t.Fatalf("active turn not preserved after the turn context:\n%#v", msgs[turnCtxIdx+1:])
 	}
+}
+
+type allCallsProvider struct {
+	calls [][]providers.Message
+}
+
+func (p *allCallsProvider) Chat(
+	_ context.Context,
+	messages []providers.Message,
+	_ []providers.ToolDefinition,
+	_ string,
+	_ map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls = append(p.calls, append([]providers.Message(nil), messages...))
+	return &providers.LLMResponse{Content: fmt.Sprintf("reply %d", len(p.calls))}, nil
+}
+
+func (p *allCallsProvider) GetDefaultModel() string { return "test-model" }
+
+// TestAgentLoop_CrossTurnPrefixStableAfterMemoryAndSummaryChange runs two real
+// turns through the agent loop with a MEMORY.md edit and a new summary in
+// between, and checks what the provider saw: the system message is
+// byte-identical, and turn 1's user message is re-sent on turn 2 exactly as it
+// was sent on turn 1 (no runtime wrapper on one side only).
+func TestAgentLoop_CrossTurnPrefixStableAfterMemoryAndSummaryChange(t *testing.T) {
+	cfg := &config.Config{}
+	provider := &allCallsProvider{}
+	t.Setenv("PICOCLAW_BUILTIN_SKILLS", t.TempDir())
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	cfg.Agents.Defaults.ModelName = "test-model"
+	cfg.Agents.Defaults.MaxTokens = 4096
+	cfg.Agents.Defaults.MaxToolIterations = 5
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+	agent := al.GetRegistry().GetDefaultAgent()
+	sessionKey := "agent:main:cache-test"
+	memPath := filepath.Join(cfg.Agents.Defaults.Workspace, "memory", "MEMORY.md")
+	if err := os.WriteFile(memPath, []byte("- fact one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(msg string) {
+		t.Helper()
+		if _, err := al.runAgentLoop(context.Background(), agent, processOptions{
+			SessionKey:      sessionKey,
+			UserMessage:     msg,
+			DefaultResponse: defaultResponse,
+		}); err != nil {
+			t.Fatalf("runAgentLoop(%q) error = %v", msg, err)
+		}
+	}
+
+	run("first question")
+	if err := os.WriteFile(memPath, []byte("- fact one\n- fact two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent.Sessions.SetSummary(sessionKey, "a fresh summary")
+	run("second question")
+
+	if len(provider.calls) != 2 {
+		t.Fatalf("provider calls = %d, want 2", len(provider.calls))
+	}
+	turn1, turn2 := provider.calls[0], provider.calls[1]
+	if turn1[0].Content != turn2[0].Content || !reflect.DeepEqual(turn1[0].SystemParts, turn2[0].SystemParts) {
+		t.Fatal("system message changed across a memory edit + summary change")
+	}
+	// turn 1: system, turn context, "first question"
+	// turn 2: system, "first question", "reply 1", turn context, "second question"
+	if len(turn2) != 5 {
+		t.Fatalf("turn 2 messages = %d, want 5", len(turn2))
+	}
+	sent1 := turn1[len(turn1)-1]
+	resent := turn2[1]
+	if sent1.Role != resent.Role || sent1.Content != resent.Content {
+		t.Fatalf("turn 1 user message re-sent differently:\nturn 1: %q\nturn 2: %q", sent1.Content, resent.Content)
+	}
+	if turn2[2].Role != "assistant" || turn2[2].Content != "reply 1" {
+		t.Fatalf("turn 2 history = %#v, want turn 1's reply", turn2[2])
+	}
+	if !strings.Contains(turn2[3].Content, "fact two") || !strings.Contains(turn2[3].Content, "a fresh summary") {
+		t.Fatalf("turn 2 turn context missing the updated memory/summary: %q", turn2[3].Content)
+	}
+	assertUserTurnWithRuntimeContext(t, turn2, "second question")
 }

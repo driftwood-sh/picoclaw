@@ -20,7 +20,7 @@ The context window is the model's total input capacity. Four regions fill it:
 | Region | Assembled by | Stored in session? |
 |---|---|---|
 | System prompt | `BuildMessages()` — static parts only (identity, workspace files, skills) | No |
-| Turn context | `BuildMessages()` — one user-role message before the current turn: workspace memory, summary | No (rebuilt every turn) |
+| Turn context | `BuildMessages()` — one user-role message before the current turn: workspace memory, summary, runtime context | No (rebuilt every turn) |
 | Summary | `SetSummary()` stores it; `BuildMessages()` injects it into the turn context | Separate from history |
 | Session history | User / assistant / tool messages | Yes |
 | Tool definitions | Provider adapter injects at call time | No |
@@ -31,7 +31,9 @@ memory and the summary change between turns, so they travel in the turn
 context message instead. That keeps the system prompt a byte-stable cache
 prefix (OpenAI's Responses API caches by prefix: any change inside
 `instructions` re-bills the whole request). The runtime context (time,
-session, sender) rides at the start of the current user message.
+session, sender) is the last block of the turn context message, so the
+current user message is sent exactly as it is stored and re-serializes
+byte-identically on later turns.
 
 `MaxTokens` (the output generation limit) must also be reserved from the total budget.
 

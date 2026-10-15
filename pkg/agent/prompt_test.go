@@ -103,8 +103,9 @@ func TestBuildMessagesFromPrompt_IncludesSystemPromptOverlay(t *testing.T) {
 	if !strings.Contains(messages[0].Content, "Use child-only system instructions.") {
 		t.Fatalf("system prompt missing overlay: %q", messages[0].Content)
 	}
-	if messages[1].Role != "user" || !strings.HasSuffix(messages[1].Content, "do child task") {
-		t.Fatalf("messages[1] = %#v, want user task (with runtime context prefix)", messages[1])
+	last := messages[len(messages)-1]
+	if last.Role != "user" || last.Content != "do child task" {
+		t.Fatalf("last message = %#v, want the user task sent as stored", last)
 	}
 }
 
@@ -158,9 +159,13 @@ func TestBuildMessagesFromPrompt_AttachesInternalPromptMetadata(t *testing.T) {
 		user.PromptSource != string(PromptSourceUserMessage) {
 		t.Fatalf("user message metadata = %#v, want turn message", user)
 	}
-	// The runtime context rides in the current user turn instead.
-	if !strings.Contains(user.Content, "[runtime context]") {
-		t.Fatalf("user turn missing runtime context segment: %q", user.Content)
+	// The runtime context rides in the turn context message; the user turn
+	// is sent exactly as it is persisted.
+	if user.Content != "hello" {
+		t.Fatalf("user turn = %q, want %q", user.Content, "hello")
+	}
+	if !strings.Contains(turnCtx.Content, "[runtime context]") {
+		t.Fatalf("turn context missing runtime context segment: %q", turnCtx.Content)
 	}
 
 	data, err := json.Marshal(messages)

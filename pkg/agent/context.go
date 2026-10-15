@@ -768,7 +768,7 @@ func (cb *ContextBuilder) LoadBootstrapFiles() string {
 // buildDynamicContext returns a short dynamic context string with per-request info.
 // This changes every request (time, session) so it is NOT part of the cached prompt;
 // BuildMessagesFromPrompt delivers it at the tail of the conversation (inside the
-// current user turn) to keep the system prompt a stable, cacheable prefix.
+// turn context message) to keep the system prompt a stable, cacheable prefix.
 // LLM-side KV cache reuse is achieved by each provider adapter's native mechanism:
 //   - Anthropic: per-block cache_control (ephemeral) on the static SystemParts block
 //   - OpenAI / Codex: prompt_cache_key for prefix-based caching
@@ -840,8 +840,8 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	// Everything that changes between turns stays OUT of the system message
 	// so it is a byte-stable, cacheable prefix: workspace memory and the
 	// conversation summary go in the per-turn context message placed before
-	// the current turn, and the runtime context (time, session, sender) is
-	// delivered in the current user turn.
+	// the current turn, together with the runtime context (time, session,
+	// sender).
 	// Everything is sent as a single system message for provider compatibility:
 	// - Anthropic adapter extracts messages[0] (Role=="system") and maps its content
 	//   to the top-level "system" parameter in the Messages API request. A single
@@ -911,8 +911,8 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 		// front of the prompt would invalidate provider-side prompt caches
 		// (Anthropic cache_control, OpenAI prefix caching) on every request.
 		// Instead it is delivered at the tail of the conversation, inside the
-		// current user turn (or inside the turn context message on heartbeat
-		// turns with no user message) — see the end of this function.
+		// turn context message just before the current turn — see the end of
+		// this function.
 		runtimeCtx = cb.buildDynamicContext(
 			req.Channel,
 			req.ChatID,
@@ -1001,41 +1001,31 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	// Add conversation history from earlier turns.
 	messages = append(messages, sanitizeHistoryForProvider(earlierHistory)...)
 
-	hasCurrentMessage := strings.TrimSpace(req.CurrentMessage) != "" || len(req.Media) > 0
-	if !hasCurrentMessage && runtimeCtx != "" {
-		// No user message to carry the runtime context (heartbeats, retry
-		// rebuilds): it rides in the turn context message instead.
+	// The per-request runtime context (time, session, sender) is the last
+	// block of the turn context message. It used to be prepended to the
+	// current user message, but only the raw message is persisted, so the
+	// next turn re-sent that message with different bytes and the provider
+	// prefix cache diverged there. Now the user message is sent exactly as it
+	// is stored.
+	if runtimeCtx != "" {
 		turnCtxParts = append(turnCtxParts, wrapRuntimeContext(runtimeCtx))
 	}
 
-	// The turn context message (memory, summary) sits immediately before the
-	// current turn. It is rebuilt every turn and never persisted, so it never
-	// accumulates in history; within a turn it is frozen in place and later
-	// iterations only append after it, so the whole prefix stays cacheable.
+	// The turn context message (memory, summary, runtime context) sits
+	// immediately before the current turn. It is rebuilt every turn and never
+	// persisted, so it never accumulates in history; within a turn it is
+	// frozen in place and later iterations only append after it, so the whole
+	// prefix stays cacheable.
 	if len(turnCtxParts) > 0 {
 		messages = append(messages, turnContextPromptMessage(turnCtxParts))
 	}
 	messages = append(messages, sanitizeHistoryForProvider(activeTurnHistory)...)
 
-	// Add current user message. Media-only turns must still be preserved so
-	// multimodal providers receive the uploaded image even when the user sends
-	// no accompanying text.
-	//
-	// The per-request runtime context (time, session, sender) rides along as a
-	// clearly-delimited segment at the start of the current user turn. Note:
-	// only the raw user message is persisted to session history, so the
-	// runtime segment is rebuilt fresh each turn and never accumulates in
-	// history.
-	if hasCurrentMessage {
-		content := req.CurrentMessage
-		if runtimeCtx != "" {
-			if strings.TrimSpace(content) != "" {
-				content = wrapRuntimeContext(runtimeCtx) + "\n\n" + content
-			} else {
-				content = wrapRuntimeContext(runtimeCtx)
-			}
-		}
-		messages = append(messages, userPromptMessage(content, req.Media))
+	// Add current user message, byte-identical to what SetupTurn persists.
+	// Media-only turns must still be preserved so multimodal providers receive
+	// the uploaded image even when the user sends no accompanying text.
+	if strings.TrimSpace(req.CurrentMessage) != "" || len(req.Media) > 0 {
+		messages = append(messages, userPromptMessage(req.CurrentMessage, req.Media))
 	}
 	if len(messages) == 0 {
 		messages = append(messages, userPromptMessage("", nil))

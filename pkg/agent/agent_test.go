@@ -528,11 +528,10 @@ func TestProcessMessage_IncludesCurrentSenderInDynamicContext(t *testing.T) {
 		t.Fatalf("system prompt must not contain sender context %q:\n%s", wantSender, systemPrompt)
 	}
 
-	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if !strings.Contains(lastMessage.Content, wantSender) {
-		t.Fatalf("user turn missing sender context %q:\n%s", wantSender, lastMessage.Content)
+	turnCtx := assertUserTurnWithRuntimeContext(t, provider.lastMessages, "hello")
+	if !strings.Contains(turnCtx.Content, wantSender) {
+		t.Fatalf("turn context missing sender context %q:\n%s", wantSender, turnCtx.Content)
 	}
-	assertUserTurnWithRuntimeContext(t, lastMessage, "hello")
 }
 
 func TestProcessMessage_DoesNotPassImplicitThinkingOffToCapableProvider(t *testing.T) {
@@ -1081,8 +1080,7 @@ func TestProcessMessage_UseCommandLoadsRequestedSkill(t *testing.T) {
 		t.Fatalf("system prompt missing requested skill content:\n%s", systemPrompt)
 	}
 
-	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	assertUserTurnWithRuntimeContext(t, lastMessage, "explain how to list files")
+	assertUserTurnWithRuntimeContext(t, provider.lastMessages, "explain how to list files")
 }
 
 func TestProcessMessage_BtwCommandRunsWithoutPersistingHistory(t *testing.T) {
@@ -1156,8 +1154,7 @@ func TestProcessMessage_BtwCommandRunsWithoutPersistingHistory(t *testing.T) {
 		t.Fatalf("turn context = %q, want the session summary", provider.lastMessages[3].Content)
 	}
 
-	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	assertUserTurnWithRuntimeContext(t, lastMessage, "explain side effects")
+	assertUserTurnWithRuntimeContext(t, provider.lastMessages, "explain side effects")
 
 	history := al.GetRegistry().GetDefaultAgent().Sessions.GetHistory(sessionKey)
 	if !reflect.DeepEqual(history, initialHistory) {
@@ -1206,13 +1203,13 @@ func TestProcessMessage_BtwCommandIncludesRequestContextAndMedia(t *testing.T) {
 	// Request context (session, sender) is delivered in the current user turn
 	// rather than the system prompt to keep the prompt prefix cache-stable.
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if !strings.Contains(lastMessage.Content, "## Current Session\nChannel: discord\nChat ID: group-1") {
-		t.Fatalf("user turn missing current session context:\n%s", lastMessage.Content)
+	turnCtx := assertUserTurnWithRuntimeContext(t, provider.lastMessages, "describe this image")
+	if !strings.Contains(turnCtx.Content, "## Current Session\nChannel: discord\nChat ID: group-1") {
+		t.Fatalf("turn context missing current session context:\n%s", turnCtx.Content)
 	}
-	if !strings.Contains(lastMessage.Content, "## Current Sender\nCurrent sender: Alice (ID: discord:123)") {
-		t.Fatalf("user turn missing current sender context:\n%s", lastMessage.Content)
+	if !strings.Contains(turnCtx.Content, "## Current Sender\nCurrent sender: Alice (ID: discord:123)") {
+		t.Fatalf("turn context missing current sender context:\n%s", turnCtx.Content)
 	}
-	assertUserTurnWithRuntimeContext(t, lastMessage, "describe this image")
 	if !reflect.DeepEqual(lastMessage.Media, []string{"media://image-1"}) {
 		t.Fatalf("last provider media = %#v, want media ref", lastMessage.Media)
 	}
@@ -1275,8 +1272,7 @@ func TestProcessMessage_BtwCommandUsesIsolatedProvider(t *testing.T) {
 	}
 
 	// Verify the question was stripped of /btw prefix
-	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	assertUserTurnWithRuntimeContext(t, lastMessage, "explain isolation")
+	assertUserTurnWithRuntimeContext(t, provider.lastMessages, "explain isolation")
 
 	// Verify main session history was NOT modified
 	currentHistory := defaultAgent.Sessions.GetHistory(mainSessionKey)
@@ -1506,8 +1502,7 @@ func TestProcessMessage_UseCommandArmsSkillForNextMessage(t *testing.T) {
 	if !strings.Contains(systemPrompt, "### Skill: shell") {
 		t.Fatalf("system prompt missing pending skill content:\n%s", systemPrompt)
 	}
-	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	assertUserTurnWithRuntimeContext(t, lastMessage, "explain how to list files")
+	assertUserTurnWithRuntimeContext(t, provider.lastMessages, "explain how to list files")
 }
 
 func TestApplyExplicitSkillCommand_ArmsSkillForNextMessage(t *testing.T) {
