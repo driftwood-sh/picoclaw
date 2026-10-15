@@ -56,6 +56,21 @@ func NewFallbackChain(cooldown *CooldownTracker, rl *RateLimiterRegistry) *Fallb
 	return &FallbackChain{cooldown: cooldown, rl: rl}
 }
 
+// WithIsolatedCooldown returns a chain that shares fc's rate limiter (its
+// requests count against the same provider quotas) but records candidate
+// failures in a fresh cooldown tracker of its own. Failures seen through the
+// returned chain never put a model into cooldown for fc's callers. Background
+// work such as conversation summaries uses it so that a failing side call
+// cannot reroute or block the user's next turn. A nil fc yields a chain with
+// no rate limiter.
+func (fc *FallbackChain) WithIsolatedCooldown() *FallbackChain {
+	var rl *RateLimiterRegistry
+	if fc != nil {
+		rl = fc.rl
+	}
+	return &FallbackChain{cooldown: NewCooldownTracker(), rl: rl}
+}
+
 // ResolveCandidates parses model config into a deduplicated candidate list.
 func ResolveCandidates(cfg ModelConfig, defaultProvider string) []FallbackCandidate {
 	return ResolveCandidatesWithLookup(cfg, defaultProvider, nil)

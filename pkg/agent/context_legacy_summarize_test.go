@@ -301,3 +301,90 @@ func TestCronSessionsAreNotSummarized(t *testing.T) {
 		})
 	}
 }
+
+// cooldownProbeProvider fails every summarization call with a retryable 500
+// and answers main-turn calls, recording which model each main call used.
+type cooldownProbeProvider struct {
+	mu           sync.Mutex
+	summaryCalls []string
+	mainCalls    []string
+}
+
+func (p *cooldownProbeProvider) Chat(
+	_ context.Context,
+	messages []providers.Message,
+	_ []providers.ToolDefinition,
+	model string,
+	_ map[string]any,
+) (*providers.LLMResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	first := ""
+	if len(messages) > 0 {
+		first = messages[0].Content
+	}
+	if strings.HasPrefix(first, "Provide a concise summary") || strings.HasPrefix(first, "Merge these two") {
+		p.summaryCalls = append(p.summaryCalls, model)
+		return nil, errors.New(`API request failed: Status: 500 Body: {"error":{"message":"server error"}}`)
+	}
+	p.mainCalls = append(p.mainCalls, model)
+	return &providers.LLMResponse{Content: "main reply"}, nil
+}
+
+func (p *cooldownProbeProvider) GetDefaultModel() string { return "unused" }
+func (p *cooldownProbeProvider) SupportsThinking() bool  { return true }
+
+// TestSummarizerFailuresDoNotCoolDownMainTurnModels: the summarizer used the
+// main turn's fallback chain, so retryable summary failures put the primary
+// and the fallback into cooldown, and the user's next turn either ran on the
+// fallback model or failed without reaching the provider. Summary failures
+// must leave main-turn model availability untouched, and summary retries must
+// really retry each candidate.
+func TestSummarizerFailuresDoNotCoolDownMainTurnModels(t *testing.T) {
+	t.Setenv("PICOCLAW_BUILTIN_SKILLS", t.TempDir())
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:                 t.TempDir(),
+				ModelName:                 "gpt-6-1-sol",
+				ModelFallbacks:            []string{"gpt-5-5"},
+				MaxTokens:                 4096,
+				MaxToolIterations:         5,
+				ContextWindow:             16000,
+				SummarizeMessageThreshold: 2,
+				SummarizeTokenPercent:     75,
+			},
+		},
+		ModelList: []*config.ModelConfig{
+			{ModelName: "gpt-6-1-sol", Provider: "openai-responses", Model: "gpt-6.1-sol", ThinkingLevel: "high"},
+			{ModelName: "gpt-5-5", Provider: "openai-responses", Model: "gpt-5.5", ThinkingLevel: "high"},
+		},
+	}
+	provider := &cooldownProbeProvider{}
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+	agent := al.GetRegistry().GetDefaultAgent()
+	if len(agent.Candidates) != 2 {
+		t.Fatalf("candidates = %d, want primary + fallback", len(agent.Candidates))
+	}
+
+	agent.Sessions.SetHistory("summary-session", sixMessageHistory())
+	lcm := &legacyContextManager{al: al}
+	lcm.summarizeSession(agent, "summary-session")
+
+	// 3 attempts x 2 candidates: each retry reached both models instead of
+	// skipping them as "in cooldown".
+	if got := len(provider.summaryCalls); got != 6 {
+		t.Errorf("summary calls = %d (%v), want 6 (3 retries x 2 candidates)", got, provider.summaryCalls)
+	}
+
+	if _, err := al.runAgentLoop(context.Background(), agent, processOptions{
+		SessionKey:      "user-session",
+		UserMessage:     "hello",
+		DefaultResponse: defaultResponse,
+	}); err != nil {
+		t.Fatalf("main turn after failed summaries: %v", err)
+	}
+	if len(provider.mainCalls) == 0 || provider.mainCalls[0] != "gpt-6.1-sol" {
+		t.Fatalf("main turn models = %v, want the primary gpt-6.1-sol first", provider.mainCalls)
+	}
+}

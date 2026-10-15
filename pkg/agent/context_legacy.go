@@ -405,14 +405,45 @@ func (m *legacyContextManager) summarizerChat(
 		return provider.Chat(ctx, messages, nil, candidate.Model, opts)
 	}
 
-	if len(candidates) > 1 && m.al != nil && m.al.fallback != nil {
-		result, err := m.al.fallback.ExecuteCandidate(ctx, candidates, run)
+	if len(candidates) > 1 {
+		// Never the main turn's chain: its cooldown tracker decides which
+		// model the user's next turn runs on, and a retryable summary failure
+		// would put the primary (or every candidate) into cooldown -- the next
+		// turn then silently ran on the fallback model with a cold cache, or
+		// failed without reaching the provider. A fresh tracker per call also
+		// lets the summary retries actually retry each candidate.
+		var shared *providers.FallbackChain
+		if m.al != nil {
+			shared = m.al.fallback
+		}
+		result, err := shared.WithIsolatedCooldown().ExecuteCandidate(ctx, candidates, run)
 		if err != nil {
+			logger.WarnCF("agent", "Summary failed on every candidate model", map[string]any{
+				"agent_id":   agent.ID,
+				"candidates": candidateModels(candidates),
+				"error":      err.Error(),
+			})
 			return nil, err
+		}
+		if len(result.Attempts) > 0 {
+			logger.WarnCF("agent", "Summary fell back to another model", map[string]any{
+				"agent_id":        agent.ID,
+				"primary_model":   candidates[0].Model,
+				"answered_by":     result.Model,
+				"failed_attempts": len(result.Attempts),
+			})
 		}
 		return result.Response, nil
 	}
 	return run(ctx, candidates[0])
+}
+
+func candidateModels(candidates []providers.FallbackCandidate) []string {
+	models := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		models = append(models, c.Model)
+	}
+	return models
 }
 
 func (m *legacyContextManager) summarizeBatch(
