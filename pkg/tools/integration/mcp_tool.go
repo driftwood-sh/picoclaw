@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -449,7 +450,7 @@ func (t *MCPTool) persistLargeTextArtifact(text string) *ToolResult {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return t.largeTextArtifactFallback(text, err)
 	}
-	// TODO: Add lifecycle cleanup/retention for MCP artifact files.
+	pruneMCPArtifacts(dir, time.Now())
 
 	pattern := fmt.Sprintf(
 		"%s_%s_*.txt",
@@ -685,4 +686,58 @@ func compactStrings(parts []string) []string {
 		compact = append(compact, part)
 	}
 	return compact
+}
+
+// mcpArtifactRetention is how long spilled MCP text artifacts are kept. Every
+// large MCP result writes a new file and nothing ever removed them: in prod a
+// listing of .artifacts/mcp/ returned up to 288K characters into the model's
+// context.
+const mcpArtifactRetention = 7 * 24 * time.Hour
+
+// mcpArtifactPruneInterval throttles retention sweeps per directory, so a
+// burst of large results does not re-scan the folder on every write.
+const mcpArtifactPruneInterval = time.Hour
+
+var mcpArtifactLastPrune sync.Map // dir -> time.Time
+
+// pruneMCPArtifacts deletes regular files in dir last modified more than
+// mcpArtifactRetention before now. It runs at most once per
+// mcpArtifactPruneInterval per directory and never fails the caller: errors
+// are logged and the spill proceeds.
+func pruneMCPArtifacts(dir string, now time.Time) {
+	if last, ok := mcpArtifactLastPrune.Load(dir); ok {
+		if now.Sub(last.(time.Time)) < mcpArtifactPruneInterval {
+			return
+		}
+	}
+	mcpArtifactLastPrune.Store(dir, now)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		logger.WarnCF("tool", "Failed to list MCP artifacts for retention", map[string]any{
+			"dir":   dir,
+			"error": err.Error(),
+		})
+		return
+	}
+	cutoff := now.Add(-mcpArtifactRetention)
+	removed := 0
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		logger.InfoCF("tool", "Pruned expired MCP artifacts", map[string]any{
+			"dir":     dir,
+			"removed": removed,
+		})
+	}
 }
