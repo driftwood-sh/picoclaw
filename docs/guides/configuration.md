@@ -69,6 +69,20 @@ PicoClaw stores data in your configured workspace (default: `~/.picoclaw/workspa
 
 > **Note:** Changes to `AGENT.md`, `SOUL.md`, `USER.md` and `memory/MEMORY.md` are automatically detected at runtime via file modification time (mtime) tracking. You do **not** need to restart the gateway after editing these files — the agent picks up the new content on the next request.
 
+#### Memory budget
+
+`memory/MEMORY.md` and the recent daily notes (`memory/YYYYMM/YYYYMMDD.md`, last 3 days) are injected into every request, in a per-turn context message placed just before the current user message (not in the system prompt, so memory edits do not invalidate the provider prompt cache). Each of the two blocks is capped at `agents.defaults.memory_max_bytes` (default `32768`, i.e. 32 KB; env `PICOCLAW_AGENTS_DEFAULTS_MEMORY_MAX_BYTES`). When a block is larger, the agent receives its first N bytes, cut at a line break, plus a notice giving the real size and the budget and telling it to curate the file (merge, shorten, delete stale lines). The gateway logs `Workspace memory over budget` at WARN level on each such turn.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "memory_max_bytes": 32768
+    }
+  }
+}
+```
+
 ### Agent Self-Evolution
 
 The `evolution` block controls PicoClaw's self-evolution runtime. When enabled, the agent records completed turns as learning records. In higher modes it can group repeated successful patterns, generate skill drafts, and optionally apply accepted drafts into workspace skills.

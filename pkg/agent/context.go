@@ -66,6 +66,16 @@ func (cb *ContextBuilder) WithToolDiscovery(useBM25, useRegex bool) *ContextBuil
 	return cb
 }
 
+// WithMemoryMaxBytes sets the injection budget for workspace memory
+// (agents.defaults.memory_max_bytes), applied to MEMORY.md and to the recent
+// daily notes separately.
+func (cb *ContextBuilder) WithMemoryMaxBytes(n int) *ContextBuilder {
+	if cb.memory != nil {
+		cb.memory.SetMaxBytes(n)
+	}
+	return cb
+}
+
 func (cb *ContextBuilder) WithSplitOnMarker(enabled bool) *ContextBuilder {
 	cb.splitOnMarker = enabled
 	return cb

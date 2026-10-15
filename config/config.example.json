@@ -11,6 +11,7 @@
       "max_tool_iterations": 20,
       "summarize_message_threshold": 20,
       "summarize_token_percent": 75,
+      "memory_max_bytes": 32768,
       "split_on_marker": false,
       "max_llm_retries": 2,
       "llm_retry_backoff_secs": 2,

@@ -12,8 +12,11 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/fileutil"
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 // MemoryStore manages persistent memory for the agent.
@@ -23,6 +26,7 @@ type MemoryStore struct {
 	workspace  string
 	memoryDir  string
 	memoryFile string
+	maxBytes   int // injection budget per block; <= 0 uses config.DefaultMemoryMaxBytes
 }
 
 // NewMemoryStore creates a new MemoryStore with the given workspace path.
@@ -129,14 +133,73 @@ func (ms *MemoryStore) GetRecentDailyNotes(days int) string {
 	return sb.String()
 }
 
+// SetMaxBytes sets the injection budget applied to MEMORY.md and, separately,
+// to the recent daily notes. Non-positive values use the config default.
+func (ms *MemoryStore) SetMaxBytes(n int) {
+	ms.maxBytes = n
+}
+
+func (ms *MemoryStore) budget() int {
+	if ms.maxBytes > 0 {
+		return ms.maxBytes
+	}
+	return config.DefaultMemoryMaxBytes
+}
+
+// capMemoryBlock keeps the first maxBytes of content (cut at a line break when
+// one falls in the second half of the budget, never inside a UTF-8 sequence)
+// and appends a notice telling the agent the block is over budget. Memory is
+// injected into every request, and an uncapped MEMORY.md once grew to 918 KB
+// and pushed the request past OpenAI's 1 MB instructions limit, failing every
+// turn until the file was trimmed by hand.
+func capMemoryBlock(content string, maxBytes int, what, curateHint string) (string, bool) {
+	if len(content) <= maxBytes {
+		return content, false
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	if nl := strings.LastIndexByte(content[:cut], '\n'); nl >= maxBytes/2 {
+		cut = nl
+	}
+	notice := fmt.Sprintf(
+		"[%s is %s, over the %s budget; only the first %s is shown above. %s]",
+		what, formatKB(len(content)), formatKB(maxBytes), formatKB(cut), curateHint,
+	)
+	return strings.TrimRight(content[:cut], "\n") + "\n\n" + notice, true
+}
+
+func formatKB(n int) string {
+	return fmt.Sprintf("%d KB", (n+1023)/1024)
+}
+
 // GetMemoryContext returns formatted memory context for the agent prompt.
-// Includes long-term memory and recent daily notes.
+// Includes long-term memory and recent daily notes, each capped at the
+// memory budget (agents.defaults.memory_max_bytes).
 func (ms *MemoryStore) GetMemoryContext() string {
 	longTerm := ms.ReadLongTerm()
 	recentNotes := ms.GetRecentDailyNotes(3)
 
 	if longTerm == "" && recentNotes == "" {
 		return ""
+	}
+
+	maxBytes := ms.budget()
+	var cappedLong, cappedNotes bool
+	longTermSize, notesSize := len(longTerm), len(recentNotes)
+	longTerm, cappedLong = capMemoryBlock(longTerm, maxBytes, "Your MEMORY.md ("+ms.memoryFile+")",
+		"Curate it now: read the full file, then merge related lines, shorten entries, "+
+			"and delete stale ones until it fits.")
+	recentNotes, cappedNotes = capMemoryBlock(recentNotes, maxBytes, "Your recent daily notes",
+		"Move what still matters into MEMORY.md and shorten or delete the rest.")
+	if cappedLong || cappedNotes {
+		logger.WarnCF("agent", "Workspace memory over budget; injecting a truncated copy", map[string]any{
+			"workspace":        ms.workspace,
+			"memory_bytes":     longTermSize,
+			"daily_note_bytes": notesSize,
+			"max_bytes":        maxBytes,
+		})
 	}
 
 	var sb strings.Builder
