@@ -105,8 +105,8 @@ func sixMessageHistory() []providers.Message {
 // TestSummarizer_UsesAPIModelIDAndThinkingWithoutTemperature reproduces the
 // audit finding: the summarizer sent the config alias ("gpt-6-1-sol") and
 // temperature 0.3, which OpenAI rejects for a reasoning model, so it could
-// never succeed. It must send what the main call path sends: the API model id
-// and the model's thinking level, and no temperature.
+// never succeed. It must send the API model id the main call path sends, low
+// reasoning effort (summaries run every turn), and no temperature.
 func TestSummarizer_UsesAPIModelIDAndThinkingWithoutTemperature(t *testing.T) {
 	provider := &summarizerRecordingProvider{}
 	al, agent := newSummarizerTestLoop(t, provider)
@@ -125,8 +125,9 @@ func TestSummarizer_UsesAPIModelIDAndThinkingWithoutTemperature(t *testing.T) {
 		if _, ok := call.opts["temperature"]; ok {
 			t.Errorf("call %d sent temperature %v; reasoning models reject it", i, call.opts["temperature"])
 		}
-		if got := call.opts["thinking_level"]; got != "high" {
-			t.Errorf("call %d thinking_level = %#v, want %q", i, got, "high")
+		// The model is configured "high"; summaries are capped at low effort.
+		if got := call.opts["thinking_level"]; got != "low" {
+			t.Errorf("call %d thinking_level = %#v, want %q", i, got, "low")
 		}
 	}
 	if got := agent.Sessions.GetSummary("s1"); got != "summary 1" {
@@ -241,5 +242,20 @@ func TestSummarizer_DiscardsSummaryWhenSessionWasCompacted(t *testing.T) {
 	}
 	if got := agent.Sessions.GetHistory("s1"); len(got) != len(replaced) {
 		t.Fatalf("history len = %d, want the compacted %d untouched", len(got), len(replaced))
+	}
+}
+
+func TestSummarizerThinking_CapsAtLowWithoutEnablingThinking(t *testing.T) {
+	for _, tc := range []struct {
+		in, want thinkingSettings
+	}{
+		{thinkingSettings{level: ThinkingHigh, configured: true}, thinkingSettings{level: ThinkingLow, configured: true}},
+		{thinkingSettings{level: ThinkingXHigh, configured: true}, thinkingSettings{level: ThinkingLow, configured: true}},
+		{thinkingSettings{level: ThinkingOff, configured: true}, thinkingSettings{level: ThinkingOff, configured: true}},
+		{thinkingSettings{}, thinkingSettings{}},
+	} {
+		if got := summarizerThinking(tc.in); got != tc.want {
+			t.Errorf("summarizerThinking(%+v) = %+v, want %+v", tc.in, got, tc.want)
+		}
 	}
 }

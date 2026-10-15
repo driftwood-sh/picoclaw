@@ -353,10 +353,10 @@ func (m *legacyContextManager) retryLLMCall(
 
 // summarizerChat sends one summarization prompt the way the main turn calls
 // its model: the agent's resolved candidates (API model id, not the config
-// alias), the candidate's provider and its configured thinking level, through
-// the fallback chain when there is more than one candidate. It sends no
-// temperature: reasoning models reject any non-default value, and the old
-// hard-coded 0.3 made every summarization request fail on gpt-6.1-sol.
+// alias) and the candidate's provider, through the fallback chain when there
+// is more than one candidate. Reasoning is capped at low (summarizerThinking).
+// It sends no temperature: reasoning models reject any non-default value, and
+// the old hard-coded 0.3 made every summarization request fail on gpt-6.1-sol.
 func (m *legacyContextManager) summarizerChat(
 	ctx context.Context,
 	agent *AgentInstance,
@@ -399,7 +399,8 @@ func (m *legacyContextManager) summarizerChat(
 				candidate.Model,
 				cfg.Agents.Defaults.Provider,
 			)
-			applyThinkingOption(opts, provider, activeThinkingSettings(agent, modelCfg), false, agent.ID)
+			thinking := summarizerThinking(activeThinkingSettings(agent, modelCfg))
+			applyThinkingOption(opts, provider, thinking, false, agent.ID)
 		}
 		return provider.Chat(ctx, messages, nil, candidate.Model, opts)
 	}
@@ -489,4 +490,16 @@ func (m *legacyContextManager) estimateTokens(messages []providers.Message) int 
 		total += EstimateMessageTokens(msg)
 	}
 	return total
+}
+
+// summarizerThinking caps reasoning for summary calls at low effort. A
+// summary is a compression of text already in hand, and it runs after nearly
+// every turn: at the main turn's "high" effort it costs ~$0.08-0.10 a run,
+// which would eat most of the prompt-cache saving. A model with thinking off
+// or not configured is left as is (no thinking is switched on).
+func summarizerThinking(settings thinkingSettings) thinkingSettings {
+	if settings.configured && settings.level != ThinkingOff {
+		settings.level = ThinkingLow
+	}
+	return settings
 }
