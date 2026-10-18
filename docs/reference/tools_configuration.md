@@ -316,6 +316,7 @@ The cron tool is used for scheduling periodic tasks.
 |---------------------------|----------|---------|----------------------------------------------------------------|
 | `enabled`                 | bool     | true    | Register the agent-facing cron tool                            |
 | `allow_command`           | bool     | true    | Allow command jobs without extra confirmation                  |
+| `command_output`          | string   | "chat"  | Where a command job's output goes: `chat` (posted as-is), `agent` (handed to the agent as a background result), `none` (logged only) |
 | `command_allowed_remotes` | string[] | []      | Remote channels or `channel:chat_id` values allowed for command jobs; `*` allows every channel and is dangerous unless all remote channels are trusted |
 | `exec_timeout_minutes`    | int      | 5       | Execution timeout in minutes, 0 means no limit                 |
 

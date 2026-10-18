@@ -80,7 +80,7 @@ The CLI `picoclaw cron add --deliver` flag uses this mode.
 
 ### `command`
 
-When a cron-tool job includes `command`, PicoClaw runs that shell command through the `exec` tool and publishes the command output back to the channel.
+When a cron-tool job includes `command`, PicoClaw runs that shell command through the `exec` tool. Where the output goes is set by `tools.cron.command_output` (below); by default it is published back to the channel as-is.
 
 For command jobs, `deliver` is forced to `false` when the job is created. The saved `message` becomes descriptive text only; the scheduled action is the shell command.
 
@@ -114,6 +114,16 @@ If `tools.exec.enabled` is `false`:
 This is not a hard disable switch. If you set `allow_command` to `false`, PicoClaw still allows a command job when the caller explicitly passes `command_confirm: true`.
 
 Command jobs also require either an internal channel or a remote channel allowed by `tools.cron.command_allowed_remotes`. Non-command reminders do not have that restriction.
+
+### `command_output`
+
+`tools.cron.command_output` says where a command job's output goes when it fires:
+
+- `chat` (default): published to the job's channel as-is.
+- `agent`: handed to the agent as a background result (a system turn from `async:cron`); nothing is published unless the agent's reply says something.
+- `none`: not published; only logged.
+
+The cron tool's description tells the model which mode is active. Raw command output in a chat reads as noise to the people in it; `agent` lets the agent decide what, if anything, to say.
 
 ### `command_allowed_remotes`
 

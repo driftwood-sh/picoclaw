@@ -1091,6 +1091,31 @@ type CronToolsConfig struct {
 	ExecTimeoutMinutes    int      `json:"exec_timeout_minutes"    env:"PICOCLAW_TOOLS_CRON_EXEC_TIMEOUT_MINUTES"`
 	AllowCommand          bool     `json:"allow_command"           env:"PICOCLAW_TOOLS_CRON_ALLOW_COMMAND"`
 	CommandAllowedRemotes []string `json:"command_allowed_remotes" env:"PICOCLAW_TOOLS_CRON_COMMAND_ALLOWED_REMOTES"`
+	// CommandOutput says where a command job's output goes when it runs:
+	// "chat" (default) posts it to the job's chat as-is; "agent" hands it to
+	// the agent as a background result, and only the agent's reply (if any)
+	// is posted; "none" posts nothing and only logs it.
+	CommandOutput string `json:"command_output,omitempty" env:"PICOCLAW_TOOLS_CRON_COMMAND_OUTPUT"`
+}
+
+// Values for tools.cron.command_output.
+const (
+	CronCommandOutputChat  = "chat"
+	CronCommandOutputAgent = "agent"
+	CronCommandOutputNone  = "none"
+)
+
+// CommandOutputMode returns the normalized command_output value. Empty and
+// unrecognized values mean "chat", today's behavior.
+func (c CronToolsConfig) CommandOutputMode() string {
+	switch strings.ToLower(strings.TrimSpace(c.CommandOutput)) {
+	case CronCommandOutputAgent:
+		return CronCommandOutputAgent
+	case CronCommandOutputNone:
+		return CronCommandOutputNone
+	default:
+		return CronCommandOutputChat
+	}
 }
 
 type ExecConfig struct {

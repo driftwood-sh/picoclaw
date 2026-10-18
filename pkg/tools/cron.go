@@ -13,6 +13,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/constants"
 	"github.com/sipeed/picoclaw/pkg/cron"
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
@@ -29,6 +30,10 @@ type JobExecutor interface {
 	PublishResponseIfNeeded(ctx context.Context, channel, chatID, sessionKey, response string)
 }
 
+// defaultCronCommandOutput applies when there is no config (inside
+// NewCronTool the package name is shadowed by its parameter).
+const defaultCronCommandOutput = config.CronCommandOutputChat
+
 // CronTool provides scheduling capabilities for the agent
 type CronTool struct {
 	cronService           *cron.CronService
@@ -38,6 +43,7 @@ type CronTool struct {
 	allowCommand          bool
 	execEnabled           bool
 	commandAllowedRemotes []string
+	commandOutput         string // config.CronCommandOutput*
 }
 
 // NewCronTool creates a new CronTool
@@ -49,10 +55,12 @@ func NewCronTool(
 	allowCommand := true
 	execEnabled := true
 	var commandAllowedRemotes []string
+	commandOutput := defaultCronCommandOutput
 	if config != nil {
 		allowCommand = config.Tools.Cron.AllowCommand
 		execEnabled = config.Tools.Exec.Enabled
 		commandAllowedRemotes = config.Tools.Cron.CommandAllowedRemotes
+		commandOutput = config.Tools.Cron.CommandOutputMode()
 	}
 
 	var execTool *ExecTool
@@ -75,6 +83,7 @@ func NewCronTool(
 		allowCommand:          allowCommand,
 		execEnabled:           execEnabled,
 		commandAllowedRemotes: commandAllowedRemotes,
+		commandOutput:         commandOutput,
 	}, nil
 }
 
@@ -90,7 +99,20 @@ IMPORTANT: When user asks to be reminded or scheduled, you MUST call this tool.
 Use 'at_seconds' for one-time reminders (e.g., 'remind me in 10 minutes' → at_seconds=600). 
 Use 'every_seconds' ONLY for recurring tasks (e.g., 'every 2 hours' → every_seconds=7200). 
 Use 'cron_expr' for complex recurring schedules. 
-Use 'command' to execute shell commands directly.`
+Use 'command' to run a shell command at that time; ` + t.commandOutputSentence()
+}
+
+// commandOutputSentence says where a command job's output goes, so the
+// model knows before it schedules one.
+func (t *CronTool) commandOutputSentence() string {
+	switch t.commandOutput {
+	case config.CronCommandOutputAgent:
+		return "its output comes back to you as a background result and is not posted."
+	case config.CronCommandOutputNone:
+		return "its output is not posted anywhere."
+	default:
+		return "its output is posted to this chat as-is."
+	}
 }
 
 // Parameters returns the tool parameters schema
@@ -115,7 +137,7 @@ func (t *CronTool) Parameters() map[string]any {
 			},
 			"command": map[string]any{
 				"type":        "string",
-				"description": "Optional: Shell command to execute directly (e.g., 'df -h'). If set, the agent will run this command and report output instead of just showing the message. For update, omit to preserve the command or pass an empty string to clear it.",
+				"description": "Optional: Shell command to run when the job fires (e.g., 'df -h'), instead of sending the message. Where its output goes is in the tool description. For update, omit to preserve the command or pass an empty string to clear it.",
 			},
 			"command_confirm": map[string]any{
 				"type":        "boolean",
@@ -613,12 +635,7 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 	if job.Payload.Command != "" {
 		if !t.execEnabled || t.execTool == nil {
 			output := "Error executing scheduled command: command execution is disabled"
-			pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer pubCancel()
-			t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
-				Context: bus.NewOutboundContext(channel, chatID, ""),
-				Content: output,
-			})
+			t.deliverCommandOutput(job, channel, chatID, output)
 			return "ok"
 		}
 
@@ -637,12 +654,7 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 			output = fmt.Sprintf("Scheduled command '%s' executed:\n%s", job.Payload.Command, result.ForLLM)
 		}
 
-		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer pubCancel()
-		t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
-			Context: bus.NewOutboundContext(channel, chatID, ""),
-			Content: output,
-		})
+		t.deliverCommandOutput(job, channel, chatID, output)
 		return "ok"
 	}
 
@@ -664,4 +676,48 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 		t.executor.PublishResponseIfNeeded(ctx, channel, chatID, sessionKey, response)
 	}
 	return "ok"
+}
+
+// cronCommandSenderID is the sender of the background result a command job
+// hands to the agent (command_output "agent"). It follows the "async:<tool>"
+// convention of async tool results, so a system turn reads it the same way.
+const cronCommandSenderID = "async:cron"
+
+// deliverCommandOutput routes a command job's output per
+// tools.cron.command_output: posted to the chat as-is ("chat", the
+// default), handed to the agent as a background result ("agent"), or only
+// logged ("none"). Raw command output posted to a chat reads as noise to the
+// people in it; "agent" lets the agent decide what, if anything, to say.
+func (t *CronTool) deliverCommandOutput(job *cron.CronJob, channel, chatID, output string) {
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pubCancel()
+
+	switch t.commandOutput {
+	case config.CronCommandOutputAgent:
+		content := fmt.Sprintf("Scheduled job %s (%s) ran its command.\n\n%s", job.ID, job.Name, output)
+		if err := t.msgBus.PublishInbound(pubCtx, bus.InboundMessage{
+			Context: bus.InboundContext{
+				Channel:  "system",
+				ChatID:   fmt.Sprintf("%s:%s", channel, chatID),
+				ChatType: "direct",
+				SenderID: cronCommandSenderID,
+			},
+			Content: content,
+		}); err != nil {
+			logger.WarnCF("cron", "Could not hand scheduled command output to the agent", map[string]any{
+				"job_id": job.ID,
+				"error":  err.Error(),
+			})
+		}
+	case config.CronCommandOutputNone:
+		logger.InfoCF("cron", "Scheduled command finished; output not posted (command_output=none)", map[string]any{
+			"job_id":     job.ID,
+			"output_len": len(output),
+		})
+	default:
+		t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
+			Context: bus.NewOutboundContext(channel, chatID, ""),
+			Content: output,
+		})
+	}
 }

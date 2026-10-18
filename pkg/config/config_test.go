@@ -3388,3 +3388,44 @@ func TestLoadConfig_ExecLongRunningHint(t *testing.T) {
 		t.Fatalf("LongRunningHint = %q", got)
 	}
 }
+
+func TestCronToolsConfig_CommandOutputMode(t *testing.T) {
+	cases := map[string]string{
+		"":        CronCommandOutputChat,
+		"chat":    CronCommandOutputChat,
+		" Agent ": CronCommandOutputAgent,
+		"none":    CronCommandOutputNone,
+		"post":    CronCommandOutputChat,
+	}
+	for in, want := range cases {
+		if got := (CronToolsConfig{CommandOutput: in}).CommandOutputMode(); got != want {
+			t.Errorf("CommandOutputMode(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// tools.cron.command_output is a known key: a config that sets it loads.
+func TestLoadConfig_CronCommandOutput(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	raw := `{
+		"version": 3,
+		"tools": {
+			"cron": {
+				"enabled": true,
+				"allow_command": false,
+				"command_output": "agent"
+			}
+		}
+	}`
+	if err := os.WriteFile(configPath, []byte(raw), 0o644); err != nil {
+		t.Fatalf("WriteFile(configPath): %v", err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+	if got := cfg.Tools.Cron.CommandOutputMode(); got != CronCommandOutputAgent {
+		t.Fatalf("CommandOutputMode() = %q, want agent", got)
+	}
+}
