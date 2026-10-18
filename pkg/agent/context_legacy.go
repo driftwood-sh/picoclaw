@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
@@ -30,18 +33,21 @@ func (m *legacyContextManager) Assemble(_ context.Context, req *AssembleRequest)
 		return &AssembleResponse{}, nil
 	}
 	history := agent.Sessions.GetHistory(req.SessionKey)
-	summary := agent.Sessions.GetSummary(req.SessionKey)
+	// Clean on read: a summary written by an older build may be nothing but
+	// stacked compression notes. Cleaning here fixes the prompt at once,
+	// without waiting for the next write.
+	summary := cleanSessionSummary(agent.Sessions.GetSummary(req.SessionKey))
 	return &AssembleResponse{
 		History: history,
 		Summary: summary,
 	}, nil
 }
 
-func (m *legacyContextManager) Compact(_ context.Context, req *CompactRequest) error {
+func (m *legacyContextManager) Compact(ctx context.Context, req *CompactRequest) error {
 	switch req.Reason {
 	case ContextCompressReasonProactive, ContextCompressReasonRetry:
 		// Sync emergency compression — budget exceeded.
-		if result, ok := m.forceCompression(req.SessionKey); ok {
+		if result, ok := m.forceCompression(ctx, req.SessionKey); ok {
 			m.al.emitEvent(
 				runtimeevents.KindAgentContextCompress,
 				m.al.newTurnEventScope("", req.SessionKey, nil).meta(0, "forceCompression", "turn.context.compress"),
@@ -49,6 +55,7 @@ func (m *legacyContextManager) Compact(_ context.Context, req *CompactRequest) e
 					Reason:            req.Reason,
 					DroppedMessages:   result.DroppedMessages,
 					RemainingMessages: result.RemainingMessages,
+					Summarized:        result.Summarized,
 				},
 			)
 		}
@@ -110,12 +117,22 @@ func (m *legacyContextManager) maybeSummarize(sessionKey string) {
 type compressionResult struct {
 	DroppedMessages   int
 	RemainingMessages int
+	// Summarized reports that the dropped messages were folded into the
+	// session summary. False means the summary was left as it was.
+	Summarized bool
 }
 
 // forceCompression aggressively reduces context when the limit is hit.
 // It drops the oldest ~50% of Turns (a Turn is a complete user→LLM→response
 // cycle, as defined in #1316), so tool-call sequences are never split.
-func (m *legacyContextManager) forceCompression(sessionKey string) (compressionResult, bool) {
+//
+// The dropped messages are folded into the session summary with one model
+// call. If that call fails, the summary stays as it was: the summary only
+// ever holds a real summary, never a note that something was dropped. (Older
+// builds appended "[Emergency compression dropped N oldest messages…]" on
+// every compression and never trimmed it; one agent's summary grew to 129 KB
+// of nothing but those notes, re-sent on every call.)
+func (m *legacyContextManager) forceCompression(ctx context.Context, sessionKey string) (compressionResult, bool) {
 	agent := m.al.registry.GetDefaultAgent()
 	if agent == nil {
 		return compressionResult{}, false
@@ -133,30 +150,50 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
 	} else {
 		mid = findSafeBoundary(history, len(history)/2)
 	}
-	var keptHistory []providers.Message
+	var keptHistory, dropped []providers.Message
 	if mid <= 0 {
 		for i := len(history) - 1; i >= 0; i-- {
 			if history[i].Role == "user" {
 				keptHistory = []providers.Message{history[i]}
+				dropped = append(append([]providers.Message(nil), history[:i]...), history[i+1:]...)
 				break
 			}
 		}
+		if keptHistory == nil {
+			dropped = history
+		}
 	} else {
 		keptHistory = history[mid:]
+		dropped = history[:mid]
 	}
 
 	droppedCount := len(history) - len(keptHistory)
 
-	existingSummary := agent.Sessions.GetSummary(sessionKey)
-	compressionNote := fmt.Sprintf(
-		"[Emergency compression dropped %d oldest messages due to context limit]",
-		droppedCount,
-	)
-	if existingSummary != "" {
-		compressionNote = existingSummary + "\n\n" + compressionNote
+	existingSummary := cleanSessionSummary(agent.Sessions.GetSummary(sessionKey))
+	newSummary, err := m.summarizeDropped(ctx, agent, dropped, existingSummary)
+	summarized := err == nil && newSummary != ""
+	if !summarized {
+		fields := map[string]any{
+			"session_key":  sessionKey,
+			"dropped_msgs": droppedCount,
+		}
+		if err != nil {
+			fields["error"] = err.Error()
+		}
+		logger.WarnCF("agent", "Emergency compression could not summarize the dropped messages; "+
+			"keeping the previous summary", fields)
+		newSummary = existingSummary
 	}
-	agent.Sessions.SetSummary(sessionKey, compressionNote)
 
+	// The summary call takes a while. Keep anything appended to the session
+	// meanwhile; the turn that asked for this compression is blocked on it,
+	// so in practice nothing is.
+	if current := agent.Sessions.GetHistory(sessionKey); len(current) > len(history) &&
+		messageSlicesEquivalent(current[:len(history)], history) {
+		keptHistory = append(append([]providers.Message(nil), keptHistory...), current[len(history):]...)
+	}
+
+	agent.Sessions.SetSummary(sessionKey, cleanSessionSummary(newSummary))
 	agent.Sessions.SetHistory(sessionKey, keptHistory)
 	agent.Sessions.Save(sessionKey)
 
@@ -164,12 +201,196 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
 		"session_key":  sessionKey,
 		"dropped_msgs": droppedCount,
 		"new_count":    len(keptHistory),
+		"summarized":   summarized,
 	})
 
 	return compressionResult{
 		DroppedMessages:   droppedCount,
 		RemainingMessages: len(keptHistory),
+		Summarized:        summarized,
 	}, true
+}
+
+const (
+	// maxSessionSummaryBytes caps the stored and injected conversation
+	// summary. The summary rides in every request of the session, so a
+	// summary that grows without bound costs tokens on every call.
+	maxSessionSummaryBytes = 6 * 1024
+	// summaryWordBudget is the length the summarizer is asked to stay under;
+	// maxSessionSummaryBytes is only the backstop.
+	summaryWordBudget = 500
+	// summaryPromptPrefix opens every summary prompt.
+	summaryPromptPrefix = "Write the conversation summary."
+	// summaryTrimmedMarker opens a summary that was cut to the cap.
+	summaryTrimmedMarker = "[Older summary text trimmed to fit.]"
+
+	// emergencySummaryTimeout bounds the summary call made inside a turn by
+	// forceCompression. The turn waits on it, so it is shorter than the
+	// background summarizeTimeout.
+	emergencySummaryTimeout = 2 * time.Minute
+	// emergencySummaryAttempts is how often forceCompression tries the
+	// summary call before keeping the previous summary.
+	emergencySummaryAttempts = 2
+	// Per-message caps for the transcript forceCompression summarizes, and
+	// a cap on the whole transcript (its newest part is kept).
+	droppedTextMaxChars       = 2000
+	droppedToolResultMaxChars = 600
+	droppedToolArgsMaxChars   = 300
+	droppedTranscriptMaxChars = 120000
+)
+
+// compressionNotePattern matches the drop notes older builds appended to the
+// summary on every emergency compression.
+var compressionNotePattern = regexp.MustCompile(
+	`\[Emergency compression dropped \d+ oldest messages due to context limit\]`,
+)
+
+var blankLinesPattern = regexp.MustCompile(`\n{3,}`)
+
+// cleanSessionSummary removes the stacked compression notes older builds
+// wrote into the summary and caps what is left at maxSessionSummaryBytes.
+func cleanSessionSummary(summary string) string {
+	if summary == "" {
+		return ""
+	}
+	cleaned := compressionNotePattern.ReplaceAllString(summary, "")
+	cleaned = blankLinesPattern.ReplaceAllString(cleaned, "\n\n")
+	return capSessionSummary(strings.TrimSpace(cleaned), maxSessionSummaryBytes)
+}
+
+// capSessionSummary keeps the newest maxBytes of the summary (at a line
+// boundary when one is near), behind a one-line marker. The marker never
+// stacks: a summary that already carries it is re-cut from its body.
+func capSessionSummary(summary string, maxBytes int) string {
+	if len(summary) <= maxBytes {
+		return summary
+	}
+	body := strings.TrimSpace(strings.TrimPrefix(summary, summaryTrimmedMarker))
+	keep := maxBytes - len(summaryTrimmedMarker) - 1
+	if keep <= 0 {
+		return ""
+	}
+	if len(body) > keep {
+		body = body[len(body)-keep:]
+		for len(body) > 0 && !utf8.RuneStart(body[0]) {
+			body = body[1:]
+		}
+		if i := strings.IndexByte(body, '\n'); i >= 0 && i < len(body)/4 {
+			body = body[i+1:]
+		}
+	}
+	return summaryTrimmedMarker + "\n" + body
+}
+
+// summaryInstructions is the instruction block for every summary call. The
+// summary is read at the start of every later turn, so it keeps what later
+// work depends on and drops the rest.
+func summaryInstructions() string {
+	return fmt.Sprintf(
+		summaryPromptPrefix+` It is read at the start of every later turn of this conversation, so keep only what later work depends on:
+- the user's instructions and decisions, quoted verbatim;
+- open tasks and where each stands;
+- ids the work depends on: pending approval ids with the exact arguments they were requested with, job ids, run ids, file paths and URLs;
+- deadlines and dates.
+Leave out routine tool chatter and finished work nothing depends on. Write plain text, at most %d words.
+`,
+		summaryWordBudget,
+	)
+}
+
+// summarizeDropped folds the messages forceCompression drops into the
+// existing summary. Tool calls and tool results are included in short form,
+// because the ids later work needs (jobs, runs, approvals) usually arrive in
+// them. Returns "" with nil error when there is nothing to summarize.
+func (m *legacyContextManager) summarizeDropped(
+	ctx context.Context,
+	agent *AgentInstance,
+	dropped []providers.Message,
+	existingSummary string,
+) (string, error) {
+	transcript := droppedTranscript(dropped)
+	if transcript == "" {
+		return "", nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, emergencySummaryTimeout)
+	defer cancel()
+
+	var sb strings.Builder
+	sb.WriteString(summaryInstructions())
+	if existingSummary != "" {
+		sb.WriteString("\nEXISTING SUMMARY (fold it in; it covers what came before these messages):\n")
+		sb.WriteString(existingSummary)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\nMESSAGES TO FOLD IN (oldest first):\n")
+	sb.WriteString(transcript)
+
+	resp, err := m.retryLLMCall(ctx, agent, sb.String(), emergencySummaryAttempts)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Content), nil
+}
+
+// droppedTranscript renders messages for the emergency summary: text in
+// full up to a cap, tool calls as name(args), tool results truncated. The
+// whole transcript keeps its newest droppedTranscriptMaxChars.
+func droppedTranscript(messages []providers.Message) string {
+	var sb strings.Builder
+	for _, msg := range messages {
+		switch msg.Role {
+		case "user", "assistant":
+			if text := strings.TrimSpace(msg.Content); text != "" {
+				fmt.Fprintf(&sb, "%s: %s\n", msg.Role, truncateRunes(text, droppedTextMaxChars))
+			}
+			for _, tc := range msg.ToolCalls {
+				name := tc.Name
+				args := ""
+				if tc.Function != nil {
+					if name == "" {
+						name = tc.Function.Name
+					}
+					args = tc.Function.Arguments
+				}
+				if args == "" && len(tc.Arguments) > 0 {
+					if raw, err := json.Marshal(tc.Arguments); err == nil {
+						args = string(raw)
+					}
+				}
+				if name == "" {
+					continue
+				}
+				fmt.Fprintf(&sb, "assistant called %s(%s)\n", name, truncateRunes(args, droppedToolArgsMaxChars))
+			}
+		case "tool":
+			if text := strings.TrimSpace(msg.Content); text != "" {
+				fmt.Fprintf(&sb, "tool result: %s\n", truncateRunes(text, droppedToolResultMaxChars))
+			}
+		}
+	}
+	out := sb.String()
+	if len(out) > droppedTranscriptMaxChars {
+		out = out[len(out)-droppedTranscriptMaxChars:]
+		for len(out) > 0 && !utf8.RuneStart(out[0]) {
+			out = out[1:]
+		}
+		if i := strings.IndexByte(out, '\n'); i >= 0 {
+			out = out[i+1:]
+		}
+		out = "[earlier messages omitted]\n" + out
+	}
+	return out
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 // summarizeTimeout bounds one background summarization (up to three model
@@ -182,7 +403,7 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
 	defer cancel()
 
 	history := agent.Sessions.GetHistory(sessionKey)
-	summary := agent.Sessions.GetSummary(sessionKey)
+	summary := cleanSessionSummary(agent.Sessions.GetSummary(sessionKey))
 
 	if len(history) <= 4 {
 		return
@@ -235,8 +456,8 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
 		s2, _ := m.summarizeBatch(ctx, agent, part2, "")
 
 		mergePrompt := fmt.Sprintf(
-			"Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s",
-			s1, s2,
+			"%s\nMerge these two consecutive summaries of the conversation into one.\n\n1 (older): %s\n\n2 (newer): %s",
+			summaryInstructions(), s1, s2,
 		)
 
 		resp, err := m.retryLLMCall(ctx, agent, mergePrompt, llmMaxRetries)
@@ -271,6 +492,7 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
 			return
 		}
 		keepCount = len(current) - safeCut
+		finalSummary = cleanSessionSummary(finalSummary)
 		agent.Sessions.SetSummary(sessionKey, finalSummary)
 		agent.Sessions.TruncateHistory(sessionKey, keepCount)
 		agent.Sessions.Save(sessionKey)
@@ -459,9 +681,9 @@ func (m *legacyContextManager) summarizeBatch(
 	)
 
 	var sb strings.Builder
-	sb.WriteString("Provide a concise summary of this conversation segment, preserving core context and key points.\n")
+	sb.WriteString(summaryInstructions())
 	if existingSummary != "" {
-		sb.WriteString("Existing context: ")
+		sb.WriteString("\nEXISTING SUMMARY (fold it in; it covers what came before this segment):\n")
 		sb.WriteString(existingSummary)
 		sb.WriteString("\n")
 	}

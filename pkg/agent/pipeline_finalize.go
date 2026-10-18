@@ -48,6 +48,9 @@ func (p *Pipeline) Finalize(
 			ModelName:        exec.llmModelName,
 			ReasoningContent: responseReasoningContent(exec.response),
 		}
+		if exec.response != nil && finalContent == exec.response.Content {
+			finalMsg.Phase = exec.response.Phase
+		}
 		ts.agent.Sessions.AddFullMessage(ts.sessionKey, finalMsg)
 		ts.recordPersistedMessage(finalMsg)
 		ts.ingestMessage(turnCtx, al, finalMsg)

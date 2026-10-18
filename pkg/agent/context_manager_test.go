@@ -329,10 +329,14 @@ func TestLegacyCompact_Overflow(t *testing.T) {
 		t.Fatalf("expected compressed history, got %d messages (was %d)", len(newHistory), len(history))
 	}
 
-	// Summary should contain compression note
+	// The dropped messages are summarized (the mock answers "test"); no
+	// drop note is ever written into the summary.
 	summary := defaultAgent.Sessions.GetSummary("session-overflow")
-	if !strings.Contains(summary, "Emergency compression") {
-		t.Fatalf("expected compression note in summary, got %q", summary)
+	if summary != "test" {
+		t.Fatalf("summary = %q, want the summarizer's answer %q", summary, "test")
+	}
+	if strings.Contains(summary, "Emergency compression") {
+		t.Fatalf("drop note written into summary: %q", summary)
 	}
 
 	// Event should carry the proactive reason

@@ -17,8 +17,50 @@ import (
 // TranslateMessages converts internal Message entries to the OpenAI Responses API
 // input format. System messages are extracted as instructions (returned separately),
 // user/assistant/tool messages become ResponseInputItemUnionParam entries.
-// Supports multipart media (images, audio).
+// Supports multipart media (images, audio). It replays no reasoning items and
+// no message phase; see TranslateMessagesForModel.
 func TranslateMessages(messages []protocoltypes.Message) (input responses.ResponseInputParam, instructions string) {
+	input, instructions, _ = translateMessages(messages, nil)
+	return input, instructions
+}
+
+// ReplayStats reports what TranslateMessagesForModel replayed beyond plain
+// messages, so a caller can retry without it if the API rejects it.
+type ReplayStats struct {
+	ReasoningItems int
+	Phases         int
+}
+
+// Replayed reports whether anything beyond plain messages was sent.
+func (s ReplayStats) Replayed() bool {
+	return s.ReasoningItems > 0 || s.Phases > 0
+}
+
+type replayOptions struct {
+	model string
+}
+
+// TranslateMessagesForModel is TranslateMessages for a stateless
+// (store=false) request to model. It also sends back what the model produced
+// earlier in the turn:
+//   - each assistant message's encrypted reasoning items, placed before that
+//     message's output, when they came from the same model (encrypted
+//     reasoning is only valid for the model that wrote it);
+//   - each assistant message's phase ("commentary" / "final_answer").
+//
+// OpenAI recommends passing reasoning items back with function call outputs;
+// without them the model starts every step of a tool loop from scratch.
+func TranslateMessagesForModel(
+	messages []protocoltypes.Message,
+	model string,
+) (input responses.ResponseInputParam, instructions string, stats ReplayStats) {
+	return translateMessages(messages, &replayOptions{model: model})
+}
+
+func translateMessages(
+	messages []protocoltypes.Message,
+	replay *replayOptions,
+) (input responses.ResponseInputParam, instructions string, stats ReplayStats) {
 	input = make(responses.ResponseInputParam, 0, len(messages))
 
 	for _, msg := range messages {
@@ -52,14 +94,18 @@ func TranslateMessages(messages []protocoltypes.Message) (input responses.Respon
 				})
 			}
 		case "assistant":
+			if replay != nil {
+				for _, item := range msg.ReasoningItems {
+					if item.EncryptedContent == "" || item.ID == "" || item.Model != replay.model {
+						continue
+					}
+					input = append(input, reasoningInputItem(item))
+					stats.ReasoningItems++
+				}
+			}
 			if len(msg.ToolCalls) > 0 {
 				if msg.Content != "" {
-					input = append(input, responses.ResponseInputItemUnionParam{
-						OfMessage: &responses.EasyInputMessageParam{
-							Role:    responses.EasyInputMessageRoleAssistant,
-							Content: responses.EasyInputMessageContentUnionParam{OfString: openai.Opt(msg.Content)},
-						},
-					})
+					input = append(input, assistantInputMessage(msg, replay, &stats))
 				}
 				for _, tc := range msg.ToolCalls {
 					name, args, ok := ResolveToolCall(tc)
@@ -75,12 +121,7 @@ func TranslateMessages(messages []protocoltypes.Message) (input responses.Respon
 					})
 				}
 			} else {
-				input = append(input, responses.ResponseInputItemUnionParam{
-					OfMessage: &responses.EasyInputMessageParam{
-						Role:    responses.EasyInputMessageRoleAssistant,
-						Content: responses.EasyInputMessageContentUnionParam{OfString: openai.Opt(msg.Content)},
-					},
-				})
+				input = append(input, assistantInputMessage(msg, replay, &stats))
 			}
 		case "tool":
 			input = append(input, responses.ResponseInputItemUnionParam{
@@ -94,7 +135,40 @@ func TranslateMessages(messages []protocoltypes.Message) (input responses.Respon
 		}
 	}
 
-	return input, instructions
+	return input, instructions, stats
+}
+
+// assistantInputMessage replays an assistant message's text, with its phase
+// when replaying for a stateless request and the API had set one.
+func assistantInputMessage(
+	msg protocoltypes.Message,
+	replay *replayOptions,
+	stats *ReplayStats,
+) responses.ResponseInputItemUnionParam {
+	param := &responses.EasyInputMessageParam{
+		Role:    responses.EasyInputMessageRoleAssistant,
+		Content: responses.EasyInputMessageContentUnionParam{OfString: openai.Opt(msg.Content)},
+	}
+	if replay != nil && msg.Phase != "" {
+		param.SetExtraFields(map[string]any{"phase": msg.Phase})
+		stats.Phases++
+	}
+	return responses.ResponseInputItemUnionParam{OfMessage: param}
+}
+
+// reasoningInputItem converts a stored reasoning item back to an input item.
+func reasoningInputItem(item protocoltypes.ReasoningItem) responses.ResponseInputItemUnionParam {
+	summary := make([]responses.ResponseReasoningItemSummaryParam, 0, len(item.Summary))
+	for _, text := range item.Summary {
+		summary = append(summary, responses.ResponseReasoningItemSummaryParam{Text: text})
+	}
+	return responses.ResponseInputItemUnionParam{
+		OfReasoning: &responses.ResponseReasoningItemParam{
+			ID:               item.ID,
+			Summary:          summary,
+			EncryptedContent: openai.Opt(item.EncryptedContent),
+		},
+	}
 }
 
 // BuildMultipartContent constructs a ResponseInputMessageContentListParam from
@@ -217,11 +291,16 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 	var content strings.Builder
 	var reasoningContent strings.Builder
 	var toolCalls []protocoltypes.ToolCall
+	var reasoningItems []protocoltypes.ReasoningItem
+	phase := ""
 	refused := false
 
 	for _, item := range apiResp.Output {
 		switch item.Type {
 		case "message":
+			if p := outputItemPhase(item); p != "" {
+				phase = p
+			}
 			for _, c := range item.Content {
 				switch c.Type {
 				case "output_text":
@@ -246,8 +325,19 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 				Arguments: args,
 			})
 		case "reasoning":
+			summary := make([]string, 0, len(item.Summary))
 			for _, s := range item.Summary {
 				reasoningContent.WriteString(s.Text)
+				summary = append(summary, s.Text)
+			}
+			// Only an item with encrypted content can be replayed when the
+			// API stores nothing (store=false); an id alone is "not found".
+			if item.ID != "" && item.EncryptedContent != "" {
+				reasoningItems = append(reasoningItems, protocoltypes.ReasoningItem{
+					ID:               item.ID,
+					EncryptedContent: item.EncryptedContent,
+					Summary:          summary,
+				})
 			}
 		}
 	}
@@ -292,5 +382,24 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 		ToolCalls:        toolCalls,
 		FinishReason:     finishReason,
 		Usage:            usage,
+		ReasoningItems:   reasoningItems,
+		Phase:            phase,
 	}
+}
+
+// outputItemPhase reads the "phase" of an output message item. The SDK
+// version in use has no typed field for it, so it is read from the item's
+// raw JSON.
+func outputItemPhase(item responses.ResponseOutputItemUnion) string {
+	raw := item.RawJSON()
+	if raw == "" || !strings.Contains(raw, `"phase"`) {
+		return ""
+	}
+	var withPhase struct {
+		Phase string `json:"phase"`
+	}
+	if err := json.Unmarshal([]byte(raw), &withPhase); err != nil {
+		return ""
+	}
+	return withPhase.Phase
 }

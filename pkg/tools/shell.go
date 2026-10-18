@@ -46,6 +46,7 @@ type ExecTool struct {
 	restrictToWorkspace bool
 	allowRemote         bool
 	sessionManager      *SessionManager
+	longRunningHint     string
 }
 
 var (
@@ -197,6 +198,10 @@ func NewExecToolWithConfig(
 	if cfg != nil && cfg.Tools.Exec.TimeoutSeconds > 0 {
 		timeout = time.Duration(cfg.Tools.Exec.TimeoutSeconds) * time.Second
 	}
+	var longRunningHint string
+	if cfg != nil {
+		longRunningHint = strings.TrimSpace(cfg.Tools.Exec.LongRunningHint)
+	}
 
 	return &ExecTool{
 		workingDir:          workingDir,
@@ -208,6 +213,7 @@ func NewExecToolWithConfig(
 		restrictToWorkspace: restrict,
 		allowRemote:         allowRemote,
 		sessionManager:      getSessionManager(),
+		longRunningHint:     longRunningHint,
 	}, nil
 }
 
@@ -215,8 +221,22 @@ func (t *ExecTool) Name() string {
 	return "exec"
 }
 
+// execToolDescription describes what the exec tool does. It deliberately
+// gives no rule for long work: "use background=true for long-running
+// commands" sent agents into start-then-poll loops (sleep, poll, sleep) that
+// hold a turn open, against deployments whose rule is to hand long work to a
+// batch runner and end the turn. A deployment states its own rule with
+// tools.exec.long_running_hint.
+const execToolDescription = `Execute shell commands. A run waits for the command to finish (or time out) and returns its output. ` +
+	`background=true starts the command without waiting and returns a sessionId; poll/read/write/send-keys/kill manage that session. ` +
+	`pty=true runs an interactive command (can combine with background=true). ` +
+	`Sessions auto-cleanup 30 minutes after the process exits; use kill to terminate early. Output buffer limit: 1MB.`
+
 func (t *ExecTool) Description() string {
-	return `Execute shell commands. Use background=true for long-running commands (returns sessionId). Use pty=true for interactive commands (can combine with background=true). Use poll/read/write/send-keys/kill with sessionId to manage background sessions. Sessions auto-cleanup 30 minutes after process exits; use kill to terminate early. Output buffer limit: 1MB.`
+	if t.longRunningHint == "" {
+		return execToolDescription
+	}
+	return execToolDescription + "\n\n" + t.longRunningHint
 }
 
 //nolint:dupl // Tool parameter schemas intentionally use similar JSON-schema map literals.

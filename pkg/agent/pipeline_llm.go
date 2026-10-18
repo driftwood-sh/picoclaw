@@ -880,6 +880,10 @@ func (p *Pipeline) CallLLM(
 		Content:          exec.response.Content,
 		ModelName:        exec.llmModelName,
 		ReasoningContent: reasoningContent,
+		Phase:            exec.response.Phase,
+		// Replayed on this turn's next calls (Responses API, store=false);
+		// in memory only, never persisted.
+		ReasoningItems: exec.response.ReasoningItems,
 	}
 	for _, tc := range exec.normalizedToolCalls {
 		argumentsJSON, _ := json.Marshal(tc.Arguments)

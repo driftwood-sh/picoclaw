@@ -103,6 +103,9 @@ type ContextCompressPayload struct {
 	Reason            ContextCompressReason
 	DroppedMessages   int
 	RemainingMessages int
+	// Summarized reports that the dropped messages were folded into the
+	// session summary (legacy context manager).
+	Summarized bool
 }
 
 // SessionSummarizePayload describes a completed async session summarization.

@@ -21,6 +21,7 @@ type (
 	ContentBlock           = protocoltypes.ContentBlock
 	CacheControl           = protocoltypes.CacheControl
 	Attachment             = protocoltypes.Attachment
+	ReasoningItem          = protocoltypes.ReasoningItem
 )
 
 type LLMProvider interface {

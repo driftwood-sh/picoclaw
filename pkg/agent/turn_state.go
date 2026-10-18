@@ -751,6 +751,8 @@ func normalizeMessageForComparison(msg providers.Message) providers.Message {
 	msg.PromptLayer = ""
 	msg.PromptSlot = ""
 	msg.PromptSource = ""
+	// In-memory only (never persisted), so a stored copy lacks them.
+	msg.ReasoningItems = nil
 
 	if len(msg.Media) == 0 {
 		msg.Media = nil

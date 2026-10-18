@@ -235,6 +235,15 @@ func cloneEventArguments(args map[string]any) map[string]any {
 	return cloned
 }
 
+// Tool results for calls a hook did not let run. "Not run" rather than
+// "denied": an approval hook also answers this way when it parks a call for a
+// human decision, which is not a denial, and the model should not read it as
+// one.
+const (
+	hookDeniedPrefix         = "Tool not run (hook)"
+	approvalHookDeniedPrefix = "Tool not run (approval hook)"
+)
+
 func hookDeniedToolContent(prefix, reason string) string {
 	if reason == "" {
 		return prefix
