@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers/common"
 	orc "github.com/sipeed/picoclaw/pkg/providers/openai_responses_common"
 	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
@@ -149,7 +151,7 @@ func (p *Provider) Chat(
 		return nil, fmt.Errorf("failed to build Azure request URL: %w", err)
 	}
 
-	input, instructions := orc.TranslateMessages(messages)
+	input, instructions, replayed := orc.TranslateMessagesForModel(messages, model)
 
 	requestBody := responses.ResponseNewParams{
 		Model: model,
@@ -180,6 +182,15 @@ func (p *Provider) Chat(
 		if effort, mapped := reasoningEffortForThinkingLevel(level); mapped {
 			requestBody.Reasoning = shared.ReasoningParam{Effort: effort}
 			reasoningApplied = true
+			if effort != shared.ReasoningEffortNone {
+				// store=false keeps nothing server-side, so ask for the
+				// reasoning back (encrypted) to replay on the next call of
+				// the turn. Current OpenAI models return it by default when
+				// store is false; the include makes it explicit.
+				requestBody.Include = []responses.ResponseIncludable{
+					responses.ResponseIncludableReasoningEncryptedContent,
+				}
+			}
 		}
 	}
 
@@ -195,6 +206,73 @@ func (p *Provider) Chat(
 		requestBody.PromptCacheKey = openai.Opt(cacheKey)
 	}
 
+	resp, err := p.send(ctx, requestURL, requestBody)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusBadRequest && replayed.Replayed() {
+		// A replayed reasoning item or phase the API will not take (for
+		// example encrypted reasoning it can no longer verify) must not
+		// fail the turn: retry once with plain messages, as before replay.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if replayRejected(body) {
+			logger.WarnCF("provider.responses", "API rejected replayed reasoning; retrying without it",
+				map[string]any{
+					"model":           model,
+					"reasoning_items": replayed.ReasoningItems,
+					"phases":          replayed.Phases,
+					"error":           common.ResponsePreview(body, 200),
+				})
+			plain, _ := orc.TranslateMessages(messages)
+			requestBody.Input = responses.ResponseNewParamsInputUnion{OfInputItemList: plain}
+			retryResp, retryErr := p.send(ctx, requestURL, requestBody)
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			defer retryResp.Body.Close()
+			resp = retryResp
+		} else {
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, common.HandleErrorResponse(resp, p.apiBase)
+	}
+
+	out, err := orc.ParseResponseBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out.ReasoningItems {
+		out.ReasoningItems[i].Model = model
+	}
+	return out, nil
+}
+
+// maxErrorBodyBytes bounds how much of an error body is read to classify it.
+const maxErrorBodyBytes = 64 * 1024
+
+// replayRejected reports whether a 400 body blames replayed reasoning or a
+// message phase, rather than the request as a whole.
+func replayRejected(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	for _, marker := range []string{"encrypted_content", "encrypted content", "reasoning", "phase"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// send marshals and posts one Responses API request.
+func (p *Provider) send(
+	ctx context.Context,
+	requestURL string,
+	requestBody responses.ResponseNewParams,
+) (*http.Response, error) {
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -224,13 +302,7 @@ func (p *Provider) Chat(
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, common.HandleErrorResponse(resp, p.apiBase)
-	}
-
-	return orc.ParseResponseBody(resp.Body)
+	return resp, nil
 }
 
 // GetDefaultModel returns an empty string as Azure deployments are user-configured.

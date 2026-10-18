@@ -35,6 +35,25 @@ type LLMResponse struct {
 	Usage            *UsageInfo        `json:"usage,omitempty"`
 	Reasoning        string            `json:"reasoning"`
 	ReasoningDetails []ReasoningDetail `json:"reasoning_details"`
+	// ReasoningItems are the Responses API's opaque reasoning items for this
+	// response (store=false: they carry encrypted_content).
+	ReasoningItems []ReasoningItem `json:"reasoning_items,omitempty"`
+	// Phase is the Responses API phase of the assistant message
+	// ("commentary" before tool calls, "final_answer"), when the API sets one.
+	Phase string `json:"phase,omitempty"`
+}
+
+// ReasoningItem is one opaque reasoning item from the OpenAI Responses API.
+// With store=false the API keeps nothing, so the model's reasoning before a
+// tool call only reaches its next call if the caller sends the item back,
+// encrypted content included.
+type ReasoningItem struct {
+	ID               string   `json:"id"`
+	EncryptedContent string   `json:"encrypted_content"`
+	Summary          []string `json:"summary,omitempty"`
+	// Model is the model id the request that produced the item named.
+	// Encrypted reasoning is replayed only to that same model.
+	Model string `json:"model,omitempty"`
 }
 
 type StreamChunk struct {
@@ -104,6 +123,16 @@ type Message struct {
 	SystemParts      []ContentBlock `json:"system_parts,omitempty"` // structured system blocks for cache-aware adapters
 	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	// Phase is the Responses API phase of an assistant message, replayed as
+	// it was received ("commentary" / "final_answer").
+	Phase string `json:"phase,omitempty"`
+
+	// ReasoningItems are the encrypted reasoning items the model produced
+	// with this assistant message (Responses API, store=false). They are
+	// replayed on the next calls of the same turn so the model continues
+	// from its own reasoning instead of re-planning after every tool call.
+	// In memory only: never written to session history or hook payloads.
+	ReasoningItems []ReasoningItem `json:"-"`
 
 	// Prompt metadata is internal to the agent runtime. It records where a
 	// message or system part came from without changing provider/session JSON.
