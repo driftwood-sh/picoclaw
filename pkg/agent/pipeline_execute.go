@@ -406,7 +406,7 @@ toolLoop:
 					})
 			case HookActionDenyTool:
 				exec.allResponsesHandled = false
-				denyContent := hookDeniedToolContent("Tool execution denied by hook", decision.Reason)
+				denyContent := hookDeniedToolContent(hookDeniedPrefix, decision.Reason)
 				al.emitEvent(
 					runtimeevents.KindAgentToolExecSkipped,
 					ts.eventMeta("runTurn", "turn.tool.skipped"),
@@ -447,7 +447,7 @@ toolLoop:
 			})
 			if !approval.Approved {
 				exec.allResponsesHandled = false
-				denyContent := hookDeniedToolContent("Tool execution denied by approval hook", approval.Reason)
+				denyContent := hookDeniedToolContent(approvalHookDeniedPrefix, approval.Reason)
 				al.emitEvent(
 					runtimeevents.KindAgentToolExecSkipped,
 					ts.eventMeta("runTurn", "turn.tool.skipped"),

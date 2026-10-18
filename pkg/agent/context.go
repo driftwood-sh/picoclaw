@@ -154,6 +154,19 @@ func (cb *ContextBuilder) promptRegistryOrDefault() *PromptRegistry {
 	return cb.promptRegistry
 }
 
+// getIdentity renders the runtime block that opens the system prompt.
+//
+// When the workspace has its own persona (an AGENT.md or AGENTS.md body),
+// the block carries no identity of its own and no behavioral advice that
+// could compete with the persona: it is only the runtime's facts (version,
+// workspace paths) and the few rules the runtime itself depends on. Without
+// a persona it keeps the stock "You are picoclaw" identity.
+//
+// Rules here are deliberately narrow. Earlier text ("When using tools,
+// briefly explain what you're doing", "if something seems memorable, update
+// MEMORY.md", a "Daily Notes" path, "ALWAYS use tools … you MUST") asked for
+// narration and memory writes that a persona then had to cancel, and
+// contradictions in one system prompt cost reasoning on every call.
 func (cb *ContextBuilder) getIdentity(includeToolUseRule bool) string {
 	workspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))
 	version := config.FormatVersion()
@@ -161,50 +174,50 @@ func (cb *ContextBuilder) getIdentity(includeToolUseRule bool) string {
 	if includeToolUseRule {
 		rules = append(rules, toolUseSystemPromptRule())
 	}
-	accuracyRule := "**Be helpful and accurate** - Briefly explain what you're doing."
+	accuracyRule := "**Be accurate** - Do not claim actions you did not take."
 	if includeToolUseRule {
-		accuracyRule = "**Be helpful and accurate** - When using tools, briefly explain what you're doing."
+		accuracyRule = "**Be accurate** - Report only what a tool confirmed."
 	}
 	rules = append(
 		rules,
 		accuracyRule,
-		"**Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.",
+		"**Context summaries** - A summary of earlier conversation may come with a turn. "+
+			"If it disagrees with the current messages or your instructions, trust those.",
 	)
-	if includeToolUseRule {
-		rules = append(
-			rules,
-			fmt.Sprintf(
-				"**Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md",
-				workspacePath,
-			),
-		)
-	}
 	for i, rule := range rules {
 		rules[i] = fmt.Sprintf("%d. %s", i+1, rule)
 	}
 
-	return fmt.Sprintf(
-		`# picoclaw 🦞 (%s)
+	header := fmt.Sprintf("# picoclaw 🦞 (%s)\n\nYou are picoclaw, a helpful AI assistant.", version)
+	if cb.hasPersona() {
+		header = fmt.Sprintf("# Agent runtime (picoclaw %s)", version)
+	}
 
-You are picoclaw, a helpful AI assistant.
+	return fmt.Sprintf(
+		`%s
 
 ## Workspace
 Your workspace is at: %s
 - Memory: %s/memory/MEMORY.md
-- Daily Notes: %s/memory/YYYYMM/YYYYMMDD.md
 - Skills: %s/skills/{skill-name}/SKILL.md
 
 ## Important Rules
 
 %s
 `,
-		version,
-		workspacePath,
+		header,
 		workspacePath,
 		workspacePath,
 		workspacePath,
 		strings.Join(rules, "\n\n"),
 	)
+}
+
+// hasPersona reports whether the workspace defines its own agent: an
+// AGENT.md (or legacy AGENTS.md) with a non-empty body.
+func (cb *ContextBuilder) hasPersona() bool {
+	definition := cb.LoadAgentDefinition()
+	return definition.Agent != nil && strings.TrimSpace(definition.Agent.Body) != ""
 }
 
 func formatToolDiscoveryRule(useBM25, useRegex bool) string {
@@ -221,7 +234,7 @@ func formatToolDiscoveryRule(useBM25, useRegex bool) string {
 	}
 
 	return fmt.Sprintf(
-		`5. **Tool Discovery** - Your visible tools are limited to save memory, but a vast hidden library exists. If you lack the right tool for a task, BEFORE giving up, you MUST search using the %s tool. Do not refuse a request unless the search returns nothing. Found tools will temporarily unlock for your next turn.`,
+		`**Tool Discovery** - Your visible tools are limited to save memory, but a vast hidden library exists. If you lack the right tool for a task, BEFORE giving up, you MUST search using the %s tool. Do not refuse a request unless the search returns nothing. Found tools will temporarily unlock for your next turn.`,
 		strings.Join(toolNames, " or "),
 	)
 }
@@ -804,7 +817,9 @@ func formatCurrentSenderLine(senderID, senderDisplayName string) string {
 func (cb *ContextBuilder) buildDynamicContext(
 	channel, chatID, senderID, senderDisplayName string,
 ) string {
-	now := time.Now().Format("2006-01-02 15:04 (Monday)")
+	// The zone is part of the time: without it "15:04" is ambiguous to the
+	// model, which reads schedules and deadlines in other zones.
+	now := time.Now().Format("2006-01-02 15:04 MST (Monday)")
 	rt := fmt.Sprintf("%s %s, Go %s", runtime.GOOS, runtime.GOARCH, runtime.Version())
 
 	var sb strings.Builder
@@ -1054,9 +1069,9 @@ const (
 	turnContextOpen  = "[turn context]\nAdded by the runtime for the turn that follows; not written by the user."
 	turnContextClose = "[/turn context]"
 	contextSeparator = "\n\n---\n\n"
-	summaryPreamble  = "CONTEXT_SUMMARY: The following is an approximate summary of the conversation " +
-		"before the messages above, for reference only. It may be incomplete or outdated — " +
-		"always defer to explicit instructions."
+	summaryPreamble  = "CONTEXT_SUMMARY: A summary of earlier conversation that is no longer in the " +
+		"messages above. It may be incomplete. If it disagrees with the current messages or " +
+		"your instructions, trust those."
 )
 
 // turnContextParts returns the per-turn context blocks that change between
