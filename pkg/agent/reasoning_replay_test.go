@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,5 +129,31 @@ func TestReasoningItems_ReplayedWithinTurnNotPersisted(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("no session files written; the persistence check proved nothing")
+	}
+}
+
+// The after_llm process hook gets the LLM response as JSON on every call. The
+// encrypted reasoning stays in the runtime: it is not in that payload.
+func TestReasoningItems_NotInAfterLLMHookPayload(t *testing.T) {
+	// Typed as the process hook's own call() takes it (params any).
+	var params any = &LLMHookResponse{
+		Model: "test-model",
+		Response: &providers.LLMResponse{
+			Content: "Checking the file.",
+			Phase:   "commentary",
+			ReasoningItems: []providers.ReasoningItem{{
+				ID: "rs_hook", EncryptedContent: "ENCRYPTED-REASONING", Model: "test-model",
+			}},
+		},
+	}
+	payload, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal hook payload: %v", err)
+	}
+	if strings.Contains(string(payload), "ENCRYPTED-REASONING") || strings.Contains(string(payload), "rs_hook") {
+		t.Fatalf("after_llm hook payload carries encrypted reasoning: %s", payload)
+	}
+	if !strings.Contains(string(payload), `"phase":"commentary"`) {
+		t.Fatalf("after_llm hook payload lost the phase: %s", payload)
 	}
 }

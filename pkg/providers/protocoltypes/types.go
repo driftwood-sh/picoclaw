@@ -36,8 +36,12 @@ type LLMResponse struct {
 	Reasoning        string            `json:"reasoning"`
 	ReasoningDetails []ReasoningDetail `json:"reasoning_details"`
 	// ReasoningItems are the Responses API's opaque reasoning items for this
-	// response (store=false: they carry encrypted_content).
-	ReasoningItems []ReasoningItem `json:"reasoning_items,omitempty"`
+	// response (store=false: they carry encrypted_content). In memory only,
+	// like Message.ReasoningItems: the after_llm process hook receives this
+	// struct as JSON on every call, and encrypted reasoning has no business
+	// leaving the runtime (a hook that rewrites the response just turns
+	// replay off for that one step).
+	ReasoningItems []ReasoningItem `json:"-"`
 	// Phase is the Responses API phase of the assistant message
 	// ("commentary" before tool calls, "final_answer"), when the API sets one.
 	Phase string `json:"phase,omitempty"`
