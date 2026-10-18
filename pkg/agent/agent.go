@@ -113,6 +113,7 @@ type processOptions struct {
 	DefaultResponse         string                 // Response when LLM returns empty
 	EnableSummary           bool                   // Whether to trigger summarization
 	SendResponse            bool                   // Whether to send response via bus
+	PublishFinalResponse    bool                   // With SendResponse false: publish only the final reply the model wrote (no tool output, no DefaultResponse)
 	AllowInterimPicoPublish bool                   // Whether pico tool-call interim text can be published when SendResponse is false
 	SuppressToolFeedback    bool                   // Whether to suppress inline tool feedback messages
 	NoHistory               bool                   // If true, don't load session history (for heartbeat)
@@ -599,7 +600,9 @@ func (al *AgentLoop) runAgentLoop(
 		}
 	}
 
-	if opts.SendResponse && result.finalContent != "" {
+	publishFinal := opts.SendResponse ||
+		(opts.PublishFinalResponse && result.finalContent != opts.DefaultResponse)
+	if publishFinal && result.finalContent != "" {
 		agentID, sessionKey, scope := outboundTurnMetadata(
 			agent.ID,
 			opts.Dispatch.SessionKey,

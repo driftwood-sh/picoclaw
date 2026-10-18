@@ -325,13 +325,23 @@ func (al *AgentLoop) processSystemMessage(
 		}
 	}
 
+	// A system turn answers a background result (an async tool or helper
+	// finishing). Its tools' user-facing output -- edit_file diffs, exec
+	// output -- is working detail, not a message for the channel, so only the
+	// final reply the model writes is published. With SendResponse true every
+	// such output was posted, hundreds of raw diffs a week to one channel.
 	return al.runAgentLoop(ctx, agent, processOptions{
-		Dispatch:        dispatch,
-		DefaultResponse: "Background task completed.",
-		EnableSummary:   false,
-		SendResponse:    true,
+		Dispatch:             dispatch,
+		DefaultResponse:      backgroundTurnDefaultResponse,
+		EnableSummary:        false,
+		SendResponse:         false,
+		PublishFinalResponse: true,
 	})
 }
+
+// backgroundTurnDefaultResponse is what a system turn records when the model
+// ends it without text. It is never published.
+const backgroundTurnDefaultResponse = "Background task completed."
 
 // isOneShotSessionKey reports whether any of the keys names a session that is
 // created for a single run and never read again (each cron run gets a fresh
