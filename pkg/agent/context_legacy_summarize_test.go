@@ -323,7 +323,7 @@ func (p *cooldownProbeProvider) Chat(
 	if len(messages) > 0 {
 		first = messages[0].Content
 	}
-	if strings.HasPrefix(first, "Provide a concise summary") || strings.HasPrefix(first, "Merge these two") {
+	if strings.HasPrefix(first, summaryPromptPrefix) {
 		p.summaryCalls = append(p.summaryCalls, model)
 		return nil, errors.New(`API request failed: Status: 500 Body: {"error":{"message":"server error"}}`)
 	}

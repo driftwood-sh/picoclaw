@@ -4461,9 +4461,10 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 		t.Errorf("Expected 'Recovered from context error', got '%s'", response)
 	}
 
-	// We expect 2 calls: 1st failed, 2nd succeeded
-	if provider.currentCall != 2 {
-		t.Errorf("Expected 2 calls (1 fail + 1 success), got %d", provider.currentCall)
+	// We expect 3 calls: the 1st failed, the 2nd summarized the messages
+	// the emergency compression dropped, the 3rd (the retry) succeeded.
+	if provider.currentCall != 3 {
+		t.Errorf("Expected 3 calls (1 fail + 1 summary + 1 success), got %d", provider.currentCall)
 	}
 
 	// Check final history length
