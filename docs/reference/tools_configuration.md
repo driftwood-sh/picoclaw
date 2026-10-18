@@ -230,6 +230,7 @@ The exec tool is used to execute shell commands.
 | `enabled`              | bool  | true    | Enable the exec tool                        |
 | `enable_deny_patterns` | bool  | true    | Enable default dangerous command blocking  |
 | `custom_deny_patterns` | array | []      | Custom deny patterns (regular expressions) |
+| `long_running_hint`    | string | ""     | Text appended to the exec tool's description: the deployment's rule for work that outlives one command (for example "start it with your batch runner and end the turn"). The stock description gives no such rule. |
 
 ### Disabling the Exec Tool
 

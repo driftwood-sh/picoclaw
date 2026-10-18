@@ -484,6 +484,7 @@ Use `mode = lines` when:
 | `tools.exec.enable_deny_patterns` | bool | `true` | Enable dangerous command interception |
 | `tools.exec.custom_deny_patterns` | string[] | `[]` | Custom regex patterns to block |
 | `tools.exec.custom_allow_patterns` | string[] | `[]` | Custom regex patterns to allow |
+| `tools.exec.long_running_hint` | string | `""` | Appended to the exec tool's description: your rule for long work (the stock text gives none) |
 
 > **Security Note:** Symlink protection is enabled by default — all file paths are resolved through `filepath.EvalSymlinks` before whitelist matching, preventing symlink escape attacks.
 

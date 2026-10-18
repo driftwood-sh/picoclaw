@@ -1100,6 +1100,10 @@ type ExecConfig struct {
 	CustomDenyPatterns  []string `                                 json:"custom_deny_patterns"  env:"PICOCLAW_TOOLS_EXEC_CUSTOM_DENY_PATTERNS"`
 	CustomAllowPatterns []string `                                 json:"custom_allow_patterns" env:"PICOCLAW_TOOLS_EXEC_CUSTOM_ALLOW_PATTERNS"`
 	TimeoutSeconds      int      `                                 json:"timeout_seconds"       env:"PICOCLAW_TOOLS_EXEC_TIMEOUT_SECONDS"` // 0 means use default (60s)
+	// LongRunningHint is appended to the exec tool's description: the
+	// deployment's own rule for work that outlives one command (for example
+	// "start it with a batch runner and end the turn"). Empty adds nothing.
+	LongRunningHint string `json:"long_running_hint,omitempty" env:"PICOCLAW_TOOLS_EXEC_LONG_RUNNING_HINT"`
 }
 
 type SkillsToolsConfig struct {
