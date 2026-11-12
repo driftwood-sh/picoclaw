@@ -95,6 +95,15 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
 				toolDefs,
 				ts.agent.MaxTokens,
 			)
+			// messages was rebuilt from the compacted history, so recompute
+			// where this turn starts in it. Left at the pre-compaction value,
+			// the index is past the end of the shorter list, and every image a
+			// tool returns in this turn is treated as history: the model gets
+			// the path tag but never the image.
+			currentTurnStart = len(messages)
+			if strings.TrimSpace(ts.userMessage) != "" || len(ts.media) > 0 {
+				currentTurnStart = len(messages) - 1
+			}
 			if dropped := originalHistoryCount - len(history); dropped > 0 {
 				logger.WarnCF("agent", "Trimmed rebuilt history after proactive compaction", map[string]any{
 					"session_key":     ts.sessionKey,
