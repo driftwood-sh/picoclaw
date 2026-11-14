@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sipeed/picoclaw/pkg/providers/common"
 )
 
 func makeCandidate(provider, model string) FallbackCandidate {
@@ -333,6 +335,19 @@ func TestFallback_TimeoutErrorFallsBack(t *testing.T) {
 		"gpt-4",
 		errors.New("failed to send request: Post \"https://example.com\": i/o timeout"),
 		"timeout fallback ok",
+		FailoverTimeout,
+	)
+}
+
+// A Cloudflare 520 from the primary provider must run the next candidate
+// instead of ending the chain with "unclassified error".
+func TestFallback_Cloudflare520FallsBack(t *testing.T) {
+	assertFallbackErrorFallsBack(
+		t,
+		"openai-responses",
+		"gpt-6.1-sol",
+		&common.HTTPError{StatusCode: 520, BodyPreview: "error code: 520"},
+		"fallback ok",
 		FailoverTimeout,
 	)
 }
