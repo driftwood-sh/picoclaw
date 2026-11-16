@@ -671,6 +671,61 @@ func TestPipeline_CallLLM_HTTP5xxRetry(t *testing.T) {
 	}
 }
 
+// A Cloudflare 520 in front of the provider is a transient server failure: the
+// same-model retry must run, like it does for a 500.
+func TestPipeline_CallLLM_Cloudflare520Retry(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &failOnceLLMProvider{
+		err:      errors.New("API request failed: Status: 520 Body: error code: 520"),
+		response: "Recovered from Cloudflare 520",
+	}
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:           tmpDir,
+				ModelName:           "test-model",
+				MaxTokens:           4096,
+				MaxToolIterations:   10,
+				MaxLLMRetries:       1,
+				LLMRetryBackoffSecs: 1,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(cfg, msgBus, provider)
+	defer al.Close()
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	pipeline := NewPipeline(al)
+	ts := newTurnState(agent, makeTestProcessOpts("test-session"), turnEventScope{
+		turnID:  "turn-1",
+		context: newTurnContext(nil, nil, nil),
+	})
+
+	exec, err := pipeline.SetupTurn(context.Background(), ts)
+	if err != nil {
+		t.Fatalf("SetupTurn failed: %v", err)
+	}
+
+	ctrl, err := pipeline.CallLLM(context.Background(), context.Background(), ts, exec, 1)
+	if err != nil {
+		t.Fatalf("expected HTTP 520 retry to recover, got error: %v", err)
+	}
+	if ctrl != ControlBreak {
+		t.Fatalf("expected ControlBreak, got %v", ctrl)
+	}
+	if exec.finalContent != "Recovered from Cloudflare 520" {
+		t.Fatalf("finalContent = %q, want recovered response", exec.finalContent)
+	}
+	if provider.callCount != 2 {
+		t.Fatalf("callCount = %d, want 2", provider.callCount)
+	}
+}
+
 func TestPipeline_CallLLM_ContextLengthError(t *testing.T) {
 	errorPrv := &errorProvider{errType: "context_length"}
 	al, agent, cleanup := newTurnCoordTestLoop(t, errorPrv)

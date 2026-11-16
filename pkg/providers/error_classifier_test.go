@@ -62,9 +62,15 @@ func TestClassifyError_StatusCodes(t *testing.T) {
 		{503, FailoverTimeout},
 		{521, FailoverTimeout},
 		{522, FailoverTimeout},
+		{504, FailoverTimeout},
+		{520, FailoverTimeout},
 		{523, FailoverTimeout},
 		{524, FailoverTimeout},
+		{525, FailoverTimeout},
+		{526, FailoverTimeout},
+		{527, FailoverTimeout},
 		{529, FailoverTimeout},
+		{530, FailoverTimeout},
 	}
 
 	for _, tt := range tests {
@@ -77,6 +83,38 @@ func TestClassifyError_StatusCodes(t *testing.T) {
 		if result.Reason != tt.reason {
 			t.Errorf("status %d: reason = %q, want %q", tt.status, result.Reason, tt.reason)
 		}
+	}
+}
+
+// A Cloudflare 520 ("unknown error" between the CDN and the origin) in front of
+// the provider is a transient server-side failure: it must classify as a
+// timeout so the same model is retried and the next candidate is tried.
+func TestClassifyError_Cloudflare520(t *testing.T) {
+	errs := map[string]error{
+		"structured": &common.HTTPError{StatusCode: 520, BodyPreview: "error code: 520"},
+		"wrapped": fmt.Errorf(
+			"fallback: %w",
+			&common.HTTPError{StatusCode: 520, BodyPreview: "error code: 520"},
+		),
+		"message only": errors.New("API request failed: Status: 520 Body: error code: 520"),
+	}
+
+	for name, err := range errs {
+		t.Run(name, func(t *testing.T) {
+			result := ClassifyError(err, "openai-responses", "gpt-6.1-sol")
+			if result == nil {
+				t.Fatal("520 must be classified (retriable), got nil")
+			}
+			if result.Reason != FailoverTimeout {
+				t.Errorf("reason = %q, want %q", result.Reason, FailoverTimeout)
+			}
+			if result.Status != 520 {
+				t.Errorf("status = %d, want 520", result.Status)
+			}
+			if !result.IsRetriable() {
+				t.Error("520 must be retriable")
+			}
+		})
 	}
 }
 

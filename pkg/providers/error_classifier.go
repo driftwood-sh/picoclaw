@@ -163,11 +163,18 @@ var (
 		rxp(`image exceeds.*mb`),
 	}
 
-	// Transient HTTP status codes that map to timeout (server-side failures).
+	// Transient HTTP status codes that map to timeout (server-side failures):
+	// the server errors 500/502/503/504, Cloudflare's 520-527 and 530 (the
+	// gateway in front of the provider could not reach or talk to the origin,
+	// e.g. 520 "unknown error" with the body "error code: 520"), and 529
+	// (overloaded). A listed set, not every 5xx: extractHTTPStatus falls back to
+	// any bare 3xx-5xx number in the message, so a blanket 5xx would make
+	// unrelated numbers in an error body retriable.
 	transientStatusCodes = map[int]bool{
-		500: true, 502: true, 503: true,
-		521: true, 522: true, 523: true, 524: true,
-		529: true,
+		500: true, 502: true, 503: true, 504: true,
+		520: true, 521: true, 522: true, 523: true, 524: true,
+		525: true, 526: true, 527: true,
+		529: true, 530: true,
 	}
 )
 
