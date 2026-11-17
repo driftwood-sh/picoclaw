@@ -357,6 +357,25 @@ func TestClassifyError_ImageDimensionError(t *testing.T) {
 	}
 }
 
+func TestClassifyError_InvalidImageError(t *testing.T) {
+	messages := []string{
+		"The image data you provided does not represent a valid image.",
+		"Invalid image: unsupported format",
+	}
+	for _, msg := range messages {
+		result := ClassifyError(errors.New(msg), "openai", "gpt-6.1-sol")
+		if result == nil {
+			t.Fatalf("%q: expected non-nil for invalid image error", msg)
+		}
+		if result.Reason != FailoverFormat {
+			t.Errorf("%q: reason = %q, want format", msg, result.Reason)
+		}
+		if result.IsRetriable() {
+			t.Errorf("%q: invalid image error should not be retriable", msg)
+		}
+	}
+}
+
 func TestClassifyError_ContextOverflowPatterns(t *testing.T) {
 	patterns := []string{
 		"context_length_exceeded",

@@ -493,6 +493,37 @@ func TestImageFallback_SizeError(t *testing.T) {
 	}
 }
 
+// A provider that rejects the image bytes answers the same way on every
+// model, so the next candidate must not be tried.
+func TestImageFallback_InvalidImageError(t *testing.T) {
+	ct := NewCooldownTracker()
+	fc := NewFallbackChain(ct, nil)
+
+	candidates := []FallbackCandidate{
+		makeCandidate("openai", "gpt-6.1-sol"),
+		makeCandidate("openai", "gpt-5.5"),
+	}
+
+	attempt := 0
+	run := func(ctx context.Context, provider, model string) (*LLMResponse, error) {
+		attempt++
+		return nil, errors.New("API request failed: Status: 400 Body: " +
+			`{"error":{"message":"The image data you provided does not represent a valid image."}}`)
+	}
+
+	_, err := fc.ExecuteImage(context.Background(), candidates, run)
+	if err == nil {
+		t.Fatal("expected error for invalid image error")
+	}
+	if attempt != 1 {
+		t.Errorf("attempt = %d, want 1 (invalid image error should not retry)", attempt)
+	}
+	var failoverErr *FailoverError
+	if !errors.As(err, &failoverErr) || failoverErr.Reason != FailoverFormat {
+		t.Errorf("error = %v, want a format FailoverError", err)
+	}
+}
+
 func TestImageFallback_RetryOnOtherErrors(t *testing.T) {
 	ct := NewCooldownTracker()
 	fc := NewFallbackChain(ct, nil)

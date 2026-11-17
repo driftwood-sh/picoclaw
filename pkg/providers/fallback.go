@@ -339,9 +339,9 @@ func (fc *FallbackChain) ExecuteImage(
 			return nil, context.Canceled
 		}
 
-		// Image dimension/size errors are non-retriable.
+		// Image dimension/size/validity errors are non-retriable.
 		errMsg := strings.ToLower(err.Error())
-		if IsImageDimensionError(errMsg) || IsImageSizeError(errMsg) {
+		if IsImageDimensionError(errMsg) || IsImageSizeError(errMsg) || IsImageInvalidError(errMsg) {
 			result.Attempts = append(result.Attempts, FallbackAttempt{
 				Provider: candidate.Provider,
 				Model:    candidate.Model,

@@ -125,7 +125,20 @@ func resolveMediaRefs(
 			pathTags = append(pathTags, buildPathTag(mime, localPath))
 
 			if m.Role == "tool" && idx >= currentTurnStart && strings.HasPrefix(mime, "image/") {
-				dataURL := encodeImageToDataURL(localPath, mime, info, maxSize)
+				// The claimed MIME comes from the tool (or the data: URL it
+				// read), so decide from the bytes what the provider receives.
+				// A file it would reject (an SVG, a corrupt image) stays
+				// reachable through its path tag but is not sent.
+				imageMIME, err := media.DetectImageFileMIME(localPath)
+				if err != nil {
+					logger.WarnCF("agent", "Skipping tool image the provider would reject", map[string]any{
+						"path":         localPath,
+						"claimed_mime": mime,
+						"error":        err.Error(),
+					})
+					continue
+				}
+				dataURL := encodeImageToDataURL(localPath, imageMIME, info, maxSize)
 				if dataURL != "" {
 					pendingToolImages = append(pendingToolImages, dataURL)
 				}
