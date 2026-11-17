@@ -1,10 +1,15 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -6724,6 +6729,160 @@ func TestResolveMediaRefs_HistoricalAndCurrentToolImagesOnlyRehydrateCurrentTurn
 	}
 	if !strings.HasPrefix(result[3].Media[0], "data:image/png;base64,") {
 		t.Fatalf("expected base64 image in synthetic follow-up, got %q", result[3].Media[0][:40])
+	}
+}
+
+// A tool result can register media whose claimed MIME is image/* but whose
+// bytes are not an image the providers accept (an inline SVG, or a file that
+// is not a decodable raster). Sending those as data URLs makes the provider
+// answer 400 "does not represent a valid image" on every candidate.
+func TestResolveMediaRefs_ToolImageNotDecodableRasterIsNotSentToModel(t *testing.T) {
+	garbagePNG := append(
+		[]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},
+		bytes.Repeat([]byte{0x00}, 64)...,
+	)
+	cases := []struct {
+		name        string
+		filename    string
+		contentType string
+		data        []byte
+	}{
+		{
+			name:        "svg",
+			filename:    "diagram.svg",
+			contentType: "image/svg+xml",
+			data:        []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>`),
+		},
+		{
+			name:        "png claim with garbage bytes",
+			filename:    "broken.png",
+			contentType: "image/png",
+			data:        garbagePNG,
+		},
+		{
+			name:        "png claim with text bytes",
+			filename:    "text.png",
+			contentType: "image/png",
+			data:        []byte("not an image at all"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := media.NewFileMediaStore()
+			path := filepath.Join(t.TempDir(), tc.filename)
+			if err := os.WriteFile(path, tc.data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ref, err := store.Store(path, media.MediaMeta{ContentType: tc.contentType}, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			messages := []providers.Message{
+				{Role: "assistant", Content: "reading the file"},
+				toolResultPromptMessage("file contents", "call_read_file_bad_image", []string{ref}),
+			}
+			result := resolveMediaRefs(messages, store, config.DefaultMaxMediaSize, 0)
+
+			if len(result) != 2 {
+				t.Fatalf("expected no synthetic image follow-up, got %d messages", len(result))
+			}
+			if hasMediaRefs(result) {
+				t.Fatalf("undecodable image must not be sent to the model, got media %v", result[1].Media)
+			}
+			// The file stays reachable for the agent through its path tag.
+			if !strings.Contains(result[1].Content, "[image:"+path+"]") {
+				t.Fatalf("expected path tag kept in tool content, got %q", result[1].Content)
+			}
+		})
+	}
+}
+
+func TestResolveMediaRefs_ToolImageSendsDetectedMIME(t *testing.T) {
+	var jpegBuf bytes.Buffer
+	if err := jpeg.Encode(&jpegBuf, image.NewRGBA(image.Rect(0, 0, 2, 2)), nil); err != nil {
+		t.Fatal(err)
+	}
+	var gifBuf bytes.Buffer
+	gifImg := image.NewPaletted(image.Rect(0, 0, 2, 2), color.Palette{color.Black, color.White})
+	if err := gif.Encode(&gifBuf, gifImg, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name        string
+		data        []byte
+		contentType string
+		wantPrefix  string
+	}{
+		{"jpeg", jpegBuf.Bytes(), "image/jpeg", "data:image/jpeg;base64,"},
+		{"gif", gifBuf.Bytes(), "image/gif", "data:image/gif;base64,"},
+		// The claimed type is wrong; the bytes decide what the provider is told.
+		{"jpeg claimed as png", jpegBuf.Bytes(), "image/png", "data:image/jpeg;base64,"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := media.NewFileMediaStore()
+			path := filepath.Join(t.TempDir(), "tool-image")
+			if err := os.WriteFile(path, tc.data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ref, err := store.Store(path, media.MediaMeta{ContentType: tc.contentType}, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			messages := []providers.Message{
+				toolResultPromptMessage("Image loaded", "call_load_image_valid", []string{ref}),
+			}
+			result := resolveMediaRefs(messages, store, config.DefaultMaxMediaSize, 0)
+
+			if len(result) != 2 || len(result[1].Media) != 1 {
+				t.Fatalf("expected one synthetic follow-up with one image, got %+v", result)
+			}
+			if !strings.HasPrefix(result[1].Media[0], tc.wantPrefix) {
+				t.Fatalf("data URL prefix = %q, want %q", result[1].Media[0][:30], tc.wantPrefix)
+			}
+		})
+	}
+}
+
+func TestResolveMediaRefs_BadToolImageDoesNotDropGoodOne(t *testing.T) {
+	store := media.NewFileMediaStore()
+	dir := t.TempDir()
+
+	svgPath := filepath.Join(dir, "chart.svg")
+	if err := os.WriteFile(svgPath, []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svgRef, _ := store.Store(svgPath, media.MediaMeta{ContentType: "image/svg+xml"}, "test")
+
+	pngPath := filepath.Join(dir, "shot.png")
+	pngHeader := []byte{
+		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+		0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02,
+		0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+	}
+	if err := os.WriteFile(pngPath, pngHeader, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pngRef, _ := store.Store(pngPath, media.MediaMeta{}, "test")
+
+	messages := []providers.Message{
+		{Role: "assistant", Content: "reading and loading"},
+		toolResultPromptMessage("file contents", "call_read_file_svg", []string{svgRef}),
+		toolResultPromptMessage("Image loaded", "call_load_image_png", []string{pngRef}),
+	}
+	result := resolveMediaRefs(messages, store, config.DefaultMaxMediaSize, 0)
+
+	if len(result) != 4 {
+		t.Fatalf("expected assistant + 2 tool results + 1 follow-up, got %d", len(result))
+	}
+	if len(result[3].Media) != 1 || !strings.HasPrefix(result[3].Media[0], "data:image/png;base64,") {
+		t.Fatalf("expected only the real PNG in the follow-up, got %v", result[3].Media)
 	}
 }
 
