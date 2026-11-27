@@ -81,6 +81,7 @@ func writeTestJPEG(t *testing.T, path string) {
 // SetupTurn, which rebuilds the messages from a shorter history. An image a
 // tool loads later in that turn must still reach the model.
 func TestSetupTurn_ForcedCompactionKeepsCurrentTurnToolImage(t *testing.T) {
+	readLogs := captureWarnLogs(t)
 	workspace := t.TempDir()
 	imagePath := filepath.Join(workspace, "screenshot.jpg")
 	writeTestJPEG(t, imagePath)
@@ -160,5 +161,10 @@ func TestSetupTurn_ForcedCompactionKeepsCurrentTurnToolImage(t *testing.T) {
 	msg := provider.secondCall[followUp]
 	if len(msg.Media) != 1 || !strings.HasPrefix(msg.Media[0], "data:image/jpeg;base64,") {
 		t.Fatalf("follow-up media = %v, want one data:image/jpeg URL", msg.Media)
+	}
+
+	// The turn start is recomputed after the compaction, so nothing is clamped.
+	if logs := readLogs(); strings.Contains(logs, turnStartClampedMessage) {
+		t.Fatalf("log = %q, want no out-of-range turn start warning after a forced compaction", logs)
 	}
 }

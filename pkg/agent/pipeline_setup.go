@@ -44,7 +44,7 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
 		currentTurnStart = len(messages) - 1
 	}
 
-	messages = resolveMediaRefs(messages, p.MediaStore, maxMediaSize, currentTurnStart)
+	messages = resolveMediaRefs(messages, p.MediaStore, maxMediaSize, currentTurnStart, ts.mediaLogIDs())
 
 	if !ts.opts.NoHistory {
 		toolDefs := filterToolsByTurnProfile(ts.agent.Tools.ToProviderDefs(), ts.profile)
@@ -89,7 +89,13 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
 					if strings.TrimSpace(ts.userMessage) != "" || len(ts.media) > 0 {
 						rebuiltCurrentTurnStart = len(rebuilt) - 1
 					}
-					return resolveMediaRefs(rebuilt, p.MediaStore, maxMediaSize, rebuiltCurrentTurnStart)
+					return resolveMediaRefs(
+						rebuilt,
+						p.MediaStore,
+						maxMediaSize,
+						rebuiltCurrentTurnStart,
+						ts.mediaLogIDs(),
+					)
 				},
 				ts.agent.ContextWindow,
 				toolDefs,
