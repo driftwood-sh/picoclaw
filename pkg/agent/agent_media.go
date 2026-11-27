@@ -31,6 +31,20 @@ var (
 	filePlaceholderRegex  = regexp.MustCompile(`\[file(:\s+[^\]]*)?\]`)
 )
 
+// turnLogIDs names the turn a media resolution belongs to. It only labels the
+// record written when a turn-start index is out of range.
+type turnLogIDs struct {
+	sessionKey string
+	turnID     string
+}
+
+func (ts *turnState) mediaLogIDs() turnLogIDs {
+	if ts == nil {
+		return turnLogIDs{}
+	}
+	return turnLogIDs{sessionKey: ts.sessionKey, turnID: ts.turnID}
+}
+
 func normalizeCurrentTurnStart(messages []providers.Message, currentTurnStart int) int {
 	if currentTurnStart < 0 {
 		return 0
@@ -39,6 +53,34 @@ func normalizeCurrentTurnStart(messages []providers.Message, currentTurnStart in
 		return len(messages)
 	}
 	return currentTurnStart
+}
+
+// warnCurrentTurnStartClamped records a turn-start index that pointed before
+// the first or past the end of messages and was clamped. len(messages) is a
+// valid index (a turn with no messages of its own yet), so only an index
+// beyond it, or a negative one, gets here. Such an index means a caller kept a
+// stale value, and every tool image after it is then treated as history: the
+// model gets the path tag but not the picture. It logs counts and ids only,
+// never message content, media paths or image data.
+func warnCurrentTurnStartClamped(
+	messages []providers.Message,
+	currentTurnStart, clamped int,
+	ids turnLogIDs,
+) {
+	toolMediaMessages := 0
+	for _, m := range messages {
+		if m.Role == "tool" && len(m.Media) > 0 {
+			toolMediaMessages++
+		}
+	}
+	logger.WarnCF("agent", "current turn start out of range, clamped", map[string]any{
+		"current_turn_start":  currentTurnStart,
+		"clamped_turn_start":  clamped,
+		"message_count":       len(messages),
+		"tool_media_messages": toolMediaMessages,
+		"session_key":         ids.sessionKey,
+		"turn_id":             ids.turnID,
+	})
 }
 
 func currentTurnMessages(messages []providers.Message, currentTurnStart int) []providers.Message {
@@ -57,16 +99,26 @@ func currentTurnMessages(messages []providers.Message, currentTurnStart int) []p
 // follow-up; historical tool results stay as plain path-tagged history.
 // Non-image files always get path tags regardless of role.
 // Returns a new slice; original messages are not mutated.
+// ids is optional: when given, it labels the warning logged if
+// currentTurnStart is out of range.
 func resolveMediaRefs(
 	messages []providers.Message,
 	store media.MediaStore,
 	maxSize int,
 	currentTurnStart int,
+	ids ...turnLogIDs,
 ) []providers.Message {
 	if store == nil {
 		return messages
 	}
-	currentTurnStart = normalizeCurrentTurnStart(messages, currentTurnStart)
+	if clamped := normalizeCurrentTurnStart(messages, currentTurnStart); clamped != currentTurnStart {
+		var turn turnLogIDs
+		if len(ids) > 0 {
+			turn = ids[0]
+		}
+		warnCurrentTurnStartClamped(messages, currentTurnStart, clamped, turn)
+		currentTurnStart = clamped
+	}
 
 	result := make([]providers.Message, 0, len(messages))
 	var pendingToolImages []string
