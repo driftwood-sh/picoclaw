@@ -138,6 +138,13 @@ var (
 		rxp(`image exceeds.*mb`),
 	}
 
+	// The provider rejected the image bytes (SVG, corrupt or unsupported
+	// format). Every model answers the same way, so retrying is pointless.
+	imageInvalidPatterns = []errorPattern{
+		substr("does not represent a valid image"),
+		substr("invalid image"),
+	}
+
 	// Transient HTTP status codes that map to timeout (server-side failures).
 	transientStatusCodes = map[int]bool{
 		500: true, 502: true, 503: true,
@@ -181,8 +188,8 @@ func ClassifyError(err error, provider, model string) *FailoverError {
 		}
 	}
 
-	// Image dimension/size errors: non-retriable, non-fallback.
-	if IsImageDimensionError(msg) || IsImageSizeError(msg) {
+	// Image dimension/size/validity errors: non-retriable, non-fallback.
+	if IsImageDimensionError(msg) || IsImageSizeError(msg) || IsImageInvalidError(msg) {
 		return &FailoverError{
 			Reason:   FailoverFormat,
 			Provider: provider,
@@ -332,6 +339,11 @@ func IsImageDimensionError(msg string) bool {
 // IsImageSizeError returns true if the message indicates an image file size error.
 func IsImageSizeError(msg string) bool {
 	return matchesAny(msg, imageSizePatterns)
+}
+
+// IsImageInvalidError returns true if the message indicates the provider rejected the image data itself.
+func IsImageInvalidError(msg string) bool {
+	return matchesAny(msg, imageInvalidPatterns)
 }
 
 // matchesAny checks if msg matches any of the patterns.
